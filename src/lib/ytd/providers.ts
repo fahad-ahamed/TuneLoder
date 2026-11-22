@@ -3,6 +3,18 @@
  * PO-token provider, MULTI cookie sets with auto-switch, on-disk MP3 cache and a
  * mirror fallback. First healthy provider wins.
  *
+ * v3 playlist-survival fixes ("2 downloads then everything fails" root causes):
+ *   - VIDEO problems (private/members-only/age-gated/removed) no longer cool
+ *     cookie sets down — only real engine rejections do (was: whole playlist
+ *     died because two tracks poisoned both sets for 3 minutes).
+ *   - Rejections rest the set 45s→90s→180s (growing) instead of a flat 3 min.
+ *   - ALL sets cooling → the track WAITS out the nearest cooldown (≤90s)
+ *     instead of instant-failing.
+ *   - 3 retry rounds with growing backoff + a server-wide circuit breaker
+ *     (4 consecutive failed tracks → one shared 25s pause, then resume).
+ *   - Sticky-set is only cleared when the sticky set itself failed.
+ *   - Live settings from the dashboard (concurrency, pacing) apply instantly.
+ *
  * v2 reliability fixes (playlist "2 downloads then fail" root causes):
  *   - GLOBAL ENGINE GATE: yt-dlp runs are serialized (default 1 at a time when
  *     cookies are armed) so YouTube never sees parallel hammering from the same
@@ -26,10 +38,12 @@ import fs from "fs";
 import net from "net";
 import path from "path";
 import { updateJob, parseDownloadLine, jobKey } from "./jobs";
+import { getSettings, effectiveMaxConcurrency } from "./settings";
 
 export const PROJECT_ROOT = process.cwd();
 export const COOKIE_DIR = path.join(PROJECT_ROOT, "data", "cookies");
 const COOKIE_STATE_FILE = path.join(COOKIE_DIR, "state.json");
+const COOKIE_META_FILE = path.join(COOKIE_DIR, "sets.json");
 
 const AUDIO_CACHE_DIR = path.join(PROJECT_ROOT, "data", "audio");
 const CACHE_CAP_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB
@@ -43,6 +57,8 @@ const FFMPEG_BIN = process.env.FFMPEG_BIN || "/usr/bin/ffmpeg";
 /** JS challenge runtime for yt-dlp (needs node ≥22; containers may bundle one → "node:/path/to/dir") */
 const JS_RUNTIME = process.env.YTDLP_JS_RUNTIME || "node";
 
+export { POT_PLUGIN_DIR, JS_RUNTIME };
+
 export function engineBinaries() {
   return { ytdlp: YTDLP_BIN, ffmpeg: FFMPEG_BIN };
 }
@@ -50,11 +66,13 @@ export function engineBinaries() {
 /**
  * How many yt-dlp children may run at once. Default is deliberately conservative:
  * with cookies armed YouTube rate-limits parallel requests from the same account,
- * which is exactly what killed playlists mid-download. Hosts override via env.
+ * which is exactly what killed playlists mid-download. Hosts override via env,
+ * admins override live from the dashboard (data/config.json → settings.ts).
  */
 export function maxConcurrency(): number {
   const n = Number(process.env.MAX_CONCURRENCY ?? (listCookieSets().length > 0 ? 1 : 2));
-  return Number.isFinite(n) && n >= 1 && n <= 8 ? Math.floor(n) : 1;
+  const auto = Number.isFinite(n) && n >= 1 && n <= 8 ? Math.floor(n) : 1;
+  return effectiveMaxConcurrency(auto);
 }
 
 export function engineQueueInfo(): { running: number; waiting: number; max: number } {
@@ -127,17 +145,107 @@ function saveLastGoodSet(id: number | null) {
 }
 
 export function cookiesEnabled(): boolean {
-  return listCookieSets().length > 0;
+  return orderedCookieSets().length > 0;
 }
 
 export function activeCookieSet(): number | null {
   return lastGoodSet;
 }
 
-/* per-set cooldown with failure classification:
-   - auth rejection ("sign in to confirm…") → set rests 3 min immediately
-   - rate-limit (429 / throttling)            → set rests 90 s
-   - transient (timeout / network)            → no cooldown (retry freely)   */
+/** Forget the sticky set when it was removed / disabled (sign-out, toggle off). */
+export function saveLastGoodSetIfRemoved() {
+  if (lastGoodSet == null) return;
+  if (!orderedCookieSets().includes(lastGoodSet)) saveLastGoodSet(null);
+}
+
+/* per-set origin + label (direct sign-in vs manual cookies.txt) + REAL verdict */
+export type CookieSetOrigin = "signin" | "manual";
+export type CookieVerdict = { at: string; ok: boolean; kind: string; message: string };
+type CookieSetMeta = { origin: CookieSetOrigin; label?: string; createdAt?: string; verify?: CookieVerdict };
+
+/** engine ignores a YouTube-rejected set for this long after its verdict */
+const AUTH_VERDICT_TTL_MS = 30 * 60 * 1000;
+
+function readSetMeta(): Record<string, CookieSetMeta> {
+  try {
+    return JSON.parse(fs.readFileSync(COOKIE_META_FILE, "utf8")) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+export function writeCookieSetMeta(id: number, meta: Partial<CookieSetMeta> & { origin: CookieSetOrigin }) {
+  try {
+    fs.mkdirSync(COOKIE_DIR, { recursive: true });
+    const all = readSetMeta();
+    all[String(id)] = { ...(all[String(id)] ?? {}), ...meta };
+    fs.writeFileSync(COOKIE_META_FILE, JSON.stringify(all, null, 2), { mode: 0o600 });
+  } catch { /* noop */ }
+}
+
+export function cookieSetOrigin(id: number): CookieSetOrigin {
+  return readSetMeta()[String(id)]?.origin === "signin" ? "signin" : "manual";
+}
+
+export function cookieSetLabel(id: number): string | undefined {
+  return readSetMeta()[String(id)]?.label;
+}
+
+export function clearCookieSetMeta(id: number) {
+  try {
+    const all = readSetMeta();
+    delete all[String(id)];
+    fs.writeFileSync(COOKIE_META_FILE, JSON.stringify(all, null, 2), { mode: 0o600 });
+  } catch { /* noop */ }
+}
+
+/** The last REAL YouTube verdict recorded for this set (probeCookieFile). */
+export function cookieSetVerdict(id: number): CookieVerdict | undefined {
+  return readSetMeta()[String(id)]?.verify;
+}
+
+/** Persist a real probe verdict for a set. */
+export function saveCookieVerdict(id: number, v: CookieVerdict) {
+  writeCookieSetMeta(id, { verify: v });
+}
+
+/**
+ * Cookie sets the engine is allowed to use RIGHT NOW, in try-order:
+ *   1. sticky last-good set (if its system is still enabled)
+ *   2. direct sign-in sessions (freshest sessions first)
+ *   3. manual cookies.txt sets
+ * Both auth systems are admin toggles (settings.auth) — a disabled system's
+ * sets are excluded even when they exist, so admins can A/B them freely.
+ * With BOTH toggles off the engine falls back to the unauthenticated chain.
+ */
+export function orderedCookieSets(): number[] {
+  const auth = getSettings().auth;
+  if (!auth.manualCookies && !auth.signIn) return [];
+  const eligible = listCookieSets().filter((id) => {
+    if (cookieSetOrigin(id) === "signin" ? !auth.signIn : !auth.manualCookies) return false;
+    // REAL rejection: a fresh probe verdict where YouTube itself refused the
+    // session (auth) → the set is excluded from the engine chain until the TTL
+    // passes or an admin re-verifies it. rate/video/transient never exile a set.
+    const v = cookieSetVerdict(id);
+    if (v && !v.ok && v.kind === "auth" && Date.now() - new Date(v.at).getTime() < AUTH_VERDICT_TTL_MS) {
+      return false;
+    }
+    return true;
+  });
+  if (!eligible.length) return [];
+  const sticky = lastGoodSet != null && eligible.includes(lastGoodSet) ? [lastGoodSet] : [];
+  const sign = eligible.filter((id) => cookieSetOrigin(id) === "signin" && !sticky.includes(id));
+  const manual = eligible.filter((id) => cookieSetOrigin(id) === "manual" && !sticky.includes(id));
+  return [...sticky, ...sign, ...manual];
+}
+
+/* per-set cooldown with failure classification (v3 — playlist survival):
+   - engine rejection ("sign in to confirm…") → set rests, growing with repeats
+     (45s → 90s → 180s): brief pauses recover a playlist, 3-min kills didn't
+   - rate-limit (429 / throttling)            → shorter rest (30s → 60s → 120s)
+   - VIDEO problems (private / members-only / age-gated / removed) → the SET is
+     healthy, the video is the problem → NO cooldown (this poisoned playlists!)
+   - transient (timeout / network)            → no cooldown (retry freely)     */
 type SetHealth = { fails: number; until: number };
 const gHealth = globalThis as unknown as { __tlSetHealth?: Map<number, SetHealth> };
 function healthMap(): Map<number, SetHealth> {
@@ -145,8 +253,11 @@ function healthMap(): Map<number, SetHealth> {
 }
 
 const isAuthFailure = (msg: string) =>
-  /sign in|not a bot|login|account|private video|members.?only|age.?d|403|401|\bunauthorized\b/i.test(msg);
+  /sign in|not a bot|confirm|use ?\(?-?\)?cookies?|\b403\b/i.test(msg);
 const isRateLimit = (msg: string) => /429|too many requests|rate.?limit|throttl/i.test(msg);
+/** the video itself can't be downloaded by ANY account — never blame the cookie set */
+const isVideoProblem = (msg: string) =>
+  /private video|members?.?only|age.?restrict|video (is )?unavailable|content isn.?t available|removed by|premiere|does not exist|no longer available|copyright/i.test(msg);
 
 function noteSetResult(id: number, ok: boolean, errMsg?: string) {
   const m = healthMap();
@@ -154,19 +265,29 @@ function noteSetResult(id: number, ok: boolean, errMsg?: string) {
   if (ok) {
     h.fails = 0;
     h.until = 0;
-  } else {
-    h.fails += 1;
-    if (errMsg && isAuthFailure(errMsg)) {
-      h.until = Date.now() + 3 * 60_000; // rejected cookie → rest 3 min
-    } else if (errMsg && isRateLimit(errMsg)) {
-      h.until = Date.now() + 90_000; // back off briefly
-    } // transient: no cooldown — the retry handles it
+    m.set(id, h);
+    return;
   }
+  if (errMsg && isVideoProblem(errMsg)) return; // cookie set stays healthy
+  h.fails += 1;
+  if (errMsg && isAuthFailure(errMsg)) {
+    h.until = Date.now() + Math.min(180_000, 45_000 * 2 ** (h.fails - 1));
+  } else if (errMsg && isRateLimit(errMsg)) {
+    h.until = Date.now() + Math.min(120_000, 30_000 * 2 ** (h.fails - 1));
+  } // transient: no cooldown — the retry handles it
   m.set(id, h);
 }
 function setCooling(id: number): boolean {
   const h = healthMap().get(id);
   return !!h && h.until > Date.now();
+}
+
+/* server-wide circuit breaker: several consecutive failed TRACKS mean the
+   IP/account is being throttled as a whole — pause briefly instead of letting
+   every remaining playlist track slam the same wall at full speed. */
+const gBreaker = globalThis as unknown as { __tlBreaker?: { streak: number; pausedUntil: number } };
+function breaker(): { streak: number; pausedUntil: number } {
+  return gBreaker.__tlBreaker ?? (gBreaker.__tlBreaker = { streak: 0, pausedUntil: 0 });
 }
 
 /* ------------------------------------------------------------------ */
@@ -219,9 +340,11 @@ function gate(): Gate {
   if (!gGate.__tlGate) {
     gGate.__tlGate = { running: 0, queue: [], max: maxConcurrency(), lastRunEnd: 0 };
   }
-  return gGate.__tlGate;
+  const g = gGate.__tlGate;
+  g.max = maxConcurrency(); // live: dashboard changes apply to the very next run
+  return g;
 }
-const RUN_GAP_MS = 700; // breathing room between consecutive engine runs
+const RUN_GAP_MS_DEFAULT = 700; // fallback breathing room (admin overrides live)
 
 async function withGate<T>(fn: () => Promise<T>): Promise<T> {
   const g = gate();
@@ -230,7 +353,8 @@ async function withGate<T>(fn: () => Promise<T>): Promise<T> {
   }
   g.running++;
   try {
-    const wait = g.lastRunEnd + RUN_GAP_MS - Date.now();
+    const gap = Math.max(RUN_GAP_MS_DEFAULT, getSettings().runGapMs);
+    const wait = g.lastRunEnd + gap - Date.now();
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
     return await fn();
   } finally {
@@ -316,7 +440,9 @@ function runYtDlp(
   videoId: string,
   bitrate: number,
   cookieFile: string | null,
-  onLog: (line: string) => void
+  onLog: (line: string) => void,
+  altClient = false,
+  cookieAlt = false
 ): Promise<string> {
   const key = jobKey(videoId, bitrate);
   clearCancelled(key); // fresh attempt
@@ -328,6 +454,17 @@ function runYtDlp(
     const args = [
       ...(cookieFile ? ["--cookies", cookieFile] : []),
       "--js-runtimes", JS_RUNTIME, // solve YouTube n-challenges (formats disappear without it)
+      // fetch the version-matched challenge-solver script when no local
+      // yt-dlp-ejs distribution is installed — cached after the first run
+      "--remote-components", "ejs:github",
+      // alt player clients (android/ios) sit in a DIFFERENT throttle pool than
+      // the web client — rescues downloads when YouTube locks web formats,
+      // which is exactly what kills playlists mid-run on datacenter IPs
+      ...(altClient ? ["--extractor-args", "youtube:player_client=android,ios"] : []),
+      // cookie-carrying clients that YouTube does NOT force into SABR-only
+      // streaming (yt-dlp #12482) — used when the web client returns empty
+      // formats for a logged-in session
+      ...(cookieAlt ? ["--extractor-args", "youtube:player_client=web_creator,tv_embedded,mweb"] : []),
       "--force-ipv4",
       "--no-warnings",
       "--no-playlist",
@@ -541,6 +678,10 @@ export function prefetchStatus(videoId: string, bitrate: number): "cached" | "ru
 async function resolveAudioInner(videoId: string, bitrate: number): Promise<ResolvedAudio> {
   const logs: string[] = [];
   const key = jobKey(videoId, bitrate);
+  // a fresh resolve is a fresh user intent: drop any stale cancel flag from a
+  // previous run, otherwise a cancelled track could NEVER be downloaded again
+  // (the flag was only cleared inside runYtDlp, which a cancelled loop skips)
+  clearCancelled(key);
   updateJob(key, { phase: "starting" });
 
   const progress = (line: string) => {
@@ -559,18 +700,43 @@ async function resolveAudioInner(videoId: string, bitrate: number): Promise<Reso
 
   await ensurePotServer();
 
-  // whole chain (cookie sets → direct → mirrors) with ONE retry round:
-  // transient rate-limits often clear within a couple of seconds.
-  for (let attempt = 0; attempt < 2; attempt++) {
+  // server-wide circuit breaker: a streak of failed tracks means YouTube is
+  // throttling this IP/account — one shared pause, then resume (this is what
+  // kept playlists alive: never hammer a wall that just rejected you).
+  const br = breaker();
+  if (br.streak >= 4 && Date.now() > br.pausedUntil) {
+    logs.push(`breaker: ${br.streak} consecutive failures — pausing 25s`);
+    br.pausedUntil = Date.now() + 25_000;
+    await new Promise((r) => setTimeout(r, 25_000));
+    br.streak = 2; // repeated badness keeps some pressure on
+  }
+
+  // whole chain (cookie sets → direct → mirrors) with THREE retry rounds and
+  // growing backoff: transient throttles and short cooldowns clear in seconds.
+  for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) {
       logs.push(`retry: round ${attempt + 1}`);
-      await new Promise((r) => setTimeout(r, 2500 + attempt * 1500));
+      await new Promise((r) => setTimeout(r, attempt === 1 ? 6_000 : 15_000));
     }
     if (isCancelled(key)) break;
 
-    const sets = listCookieSets().filter((id) => !setCooling(id));
-    const sticky = lastGoodSet != null && sets.includes(lastGoodSet) ? lastGoodSet : null;
-    const orderedSets = [...(sticky ? [sticky] : []), ...sets.filter((s) => s !== sticky)];
+    // every cookie set cooling → WAIT OUT the nearest cooldown instead of
+    // dropping the track (waiting 30-90s beats failing the rest of a playlist)
+    const allSets = listCookieSets();
+    const coolingNow = allSets.filter((id) => setCooling(id));
+    if (allSets.length > 0 && coolingNow.length === allSets.length) {
+      const waitMs = Math.min(
+        90_000,
+        Math.max(...coolingNow.map((id) => (healthMap().get(id)?.until ?? Date.now()) - Date.now())) + 1_000
+      );
+      if (waitMs > 0) {
+        logs.push(`cookies: all sets cooling — waiting ${Math.round(waitMs / 1000)}s`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        if (isCancelled(key)) break;
+      }
+    }
+
+    const orderedSets = orderedCookieSets().filter((id) => !setCooling(id));
 
     // 1) yt-dlp with cookie sets — sticky first, AUTO-SWITCH immediately on failure
     for (const id of orderedSets) {
@@ -590,20 +756,39 @@ async function resolveAudioInner(videoId: string, bitrate: number): Promise<Reso
         if (/^Cancelled$/.test(msg)) {
           return { provider: "none", cancelled: true, logs };
         }
-        noteSetResult(id, false, msg);
-        saveLastGoodSet(null);
-        logs.push(`ytdlp-ck${id}: ${msg.slice(0, 160)}`);
+        // web client returned empty formats for this session? the cookie can
+        // still be LIVE — SABR-safe cookie-capable clients are the second rung
+        try {
+          const f = await withGate(() =>
+            runYtDlp(videoId, bitrate, cookieSetPath(id), progress, false, true)
+          );
+          evictCacheIfNeeded();
+          noteSetResult(id, true);
+          saveLastGoodSet(id);
+          logs.push(`ytdlp-ck${id}+cookiealt: ok`);
+          updateJob(key, { phase: "done", pct: 100 });
+          return { provider: `ytdlp+ck${id}+ca`, localFile: f, logs };
+        } catch (e2) {
+          const msg2 = (e2 as Error).message;
+          if (/^Cancelled$/.test(msg2)) {
+            return { provider: "none", cancelled: true, logs };
+          }
+          noteSetResult(id, false, msg2);
+          if (id === lastGoodSet) saveLastGoodSet(null); // only un-stick the set that failed
+          logs.push(`ytdlp-ck${id}: ${msg2.slice(0, 160)}`);
+        }
       }
     }
 
-    // 2) yt-dlp direct (no cookies)
+    // 2) yt-dlp direct (no cookies) — retry rounds also try android/ios player
+    //    clients, whose format pool YouTube throttles separately from the web
     if (!isCancelled(key)) {
       try {
-        const f = await withGate(() => runYtDlp(videoId, bitrate, null, progress));
+        const f = await withGate(() => runYtDlp(videoId, bitrate, null, progress, attempt >= 1));
         evictCacheIfNeeded();
-        logs.push("ytdlp-direct: ok");
+        logs.push(attempt >= 1 ? "ytdlp-direct+alt: ok" : "ytdlp-direct: ok");
         updateJob(key, { phase: "done", pct: 100 });
-        return { provider: "ytdlp", localFile: f, logs };
+        return { provider: attempt >= 1 ? "ytdlp-alt" : "ytdlp", localFile: f, logs };
       } catch (e) {
         const msg = (e as Error).message;
         if (/^Cancelled$/.test(msg)) {
@@ -630,7 +815,19 @@ export function resolveAudio(videoId: string, bitrate: number): Promise<Resolved
   const m = inFlightMap();
   const existing = m.get(key);
   if (existing) return existing;
-  const p = resolveAudioInner(videoId, bitrate).finally(() => m.delete(key));
+  const p = resolveAudioInner(videoId, bitrate)
+    .then((res) => {
+      // circuit-breaker accounting: success heals, failure builds pressure
+      if (res.cancelled) return res; // user actions don't count
+      if (res.provider !== "none") breaker().streak = 0;
+      else {
+        const br = breaker();
+        br.streak += 1;
+        br.pausedUntil = 0; // allow the next track to open a pause window
+      }
+      return res;
+    })
+    .finally(() => m.delete(key));
   m.set(key, p);
   return p;
 }

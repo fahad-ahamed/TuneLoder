@@ -6,7 +6,7 @@ export default function App({ Component, pageProps }: AppProps) {
   return (
     <>
       <Component {...pageProps} />
-      <Toaster theme="dark" position="bottom-right" richColors />
+      <Toaster theme="system" position="bottom-right" richColors />
     </>
   );
 }

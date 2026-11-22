@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { cookiesEnabled, engineBinaries, maxConcurrency, listCookieSets, engineQueueInfo } from "@/lib/ytd/providers";
+import { getSettings } from "@/lib/ytd/settings";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -28,5 +29,6 @@ export async function GET() {
     cookieSets: listCookieSets().length,
     maxConcurrency: maxConcurrency(),
     queue: engineQueueInfo(),
+    settings: getSettings(),
   });
 }

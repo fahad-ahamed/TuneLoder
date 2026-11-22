@@ -23,6 +23,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Badge } from "@/components/ui/badge";
+import ThemeToggle from "@/components/theme-toggle";
 
 /* ------------------------------------------------------------------ */
 /* types                                                               */
@@ -91,8 +92,13 @@ export default function Home() {
   const [batch, setBatch] = useState<{ done: number; total: number; failed: number } | null>(null);
   const [retryTracks, setRetryTracks] = useState<Track[]>([]);
   const [maxConc, setMaxConc] = useState(2);
+  const [engine, setEngine] = useState<{ delivery: "blob" | "native"; autoPrefetch: boolean }>({
+    delivery: "blob",
+    autoPrefetch: false,
+  });
   const inputRef = useRef<HTMLInputElement>(null);
   const prefetched = useRef<Set<string>>(new Set());
+  const pfPlaylistKey = useRef<string | null>(null);
 
   /* client download pool: keeps the browser from hammering the server
      (server serializes the engine anyway — this prevents accidental
@@ -103,7 +109,15 @@ export default function Home() {
   useEffect(() => {
     fetch("/api/status")
       .then((r) => r.json())
-      .then((d) => { if (d?.maxConcurrency) setMaxConc(Math.max(1, Math.min(2, d.maxConcurrency))); })
+      .then((d) => {
+        if (d?.maxConcurrency) setMaxConc(Math.max(1, Math.min(2, d.maxConcurrency)));
+        if (d?.settings) {
+          setEngine({
+            delivery: d.settings.delivery === "native" ? "native" : "blob",
+            autoPrefetch: !!d.settings.autoPrefetchPlaylist,
+          });
+        }
+      })
       .catch(() => {});
   }, []);
 
@@ -132,6 +146,24 @@ export default function Home() {
       }
     }
   }, [info, bitrate]);
+
+  // ADMIN OPT-IN: auto-prefetch whole playlists server-side (first 50 tracks)
+  // so batch clicks land on the on-disk cache → near-instant rows.
+  useEffect(() => {
+    if (info?.type === "playlist" && engine.autoPrefetch && info.tracks.length > 0) {
+      const k = `${info.playlistId}:${bitrate}`;
+      if (pfPlaylistKey.current === k) return;
+      pfPlaylistKey.current = k;
+      fetch("/api/prefetch-batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          videoIds: info.tracks.slice(0, 50).map((t) => t.videoId),
+          bitrate,
+        }),
+      }).catch(() => {});
+    }
+  }, [info, bitrate, engine.autoPrefetch]);
 
   // keep the (free-tier) host warm while someone is actually using the site
   useEffect(() => {
@@ -199,6 +231,99 @@ export default function Home() {
     }, 1000);
 
     try {
+      if (engine.delivery === "native") {
+        // NATIVE delivery: the browser's own download-manager UI handles the
+        // file (like any other downloader) — the page doesn't hold a blob.
+        const u = new URL("/api/download-file", window.location.origin);
+        u.searchParams.set("v", t.videoId);
+        u.searchParams.set("b", String(quality));
+        u.searchParams.set("t", t.title);
+        u.searchParams.set("a", t.author);
+        const clickLink = () => {
+          const a = document.createElement("a");
+          a.href = u.toString();
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+        };
+
+        // Proxy-safe sequencing (hosting platforms often cut a response that
+        // sends no bytes for ~60s): start the engine job with a short POST,
+        // wait on /api/progress until the mp3 is on disk, and only then hit
+        // /api/download-file — that GET is then a cached, instant stream.
+        let phase = "";
+        try {
+          const p = await fetch("/api/prefetch", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ videoId: t.videoId, bitrate: quality }),
+          })
+            .then((r) => r.json())
+            .catch(() => null);
+          if (p?.status !== "cached") {
+            await new Promise<void>((resolve) => {
+              const started = performance.now();
+              const iv = setInterval(() => {
+                fetch(`/api/progress?key=${encodeURIComponent(key)}`)
+                  .then((r) => r.json())
+                  .then((j) => {
+                    if (j?.phase === "done" || j?.phase === "error") {
+                      clearInterval(iv);
+                      phase = j.phase;
+                      resolve();
+                    } else if (performance.now() - started > 330_000) {
+                      clearInterval(iv);
+                      resolve();
+                    }
+                  })
+                  .catch(() => {});
+              }, 1000);
+            });
+          }
+        } catch {
+          /* engine never started — the GET below retries server-side */
+        }
+
+        if (phase === "error") {
+          setDl((s) => ({
+            ...s,
+            [t.videoId]: { status: "error", hint: "Engine failed — try again", ms: Math.round(performance.now() - t0) },
+          }));
+          return false;
+        }
+        clickLink();
+
+        // engine phases still stream in → mirror them into the row
+        return await new Promise<boolean>((resolve) => {
+          const started = performance.now();
+          const iv = setInterval(() => {
+            fetch(`/api/progress?key=${encodeURIComponent(key)}`)
+              .then((r) => r.json())
+              .then((j) => {
+                if (j?.phase === "done") {
+                  clearInterval(iv);
+                  setDl((s) => ({
+                    ...s,
+                    [t.videoId]: { status: "done", ms: Math.round(performance.now() - t0) },
+                  }));
+                  resolve(true);
+                } else if (j?.phase === "error") {
+                  clearInterval(iv);
+                  setDl((s) => ({
+                    ...s,
+                    [t.videoId]: { status: "error", hint: "Engine failed — try again", ms: Math.round(performance.now() - t0) },
+                  }));
+                  resolve(false);
+                } else if (performance.now() - started > 330_000) {
+                  clearInterval(iv);
+                  resolve(true); // native download continues in the browser UI
+                }
+              })
+              .catch(() => {});
+          }, 1200);
+        });
+      }
+
       const res = await fetch("/api/download", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -228,7 +353,7 @@ export default function Home() {
     } finally {
       clearInterval(poll);
     }
-  }, []);
+  }, [engine.delivery]);
 
   /** pooled: never more than maxConc browser downloads in flight */
   const startDownload = useCallback(
@@ -338,7 +463,7 @@ export default function Home() {
   /* ---------------- render ---------------- */
 
   return (
-    <div className="min-h-screen flex flex-col bg-zinc-950 text-zinc-100 selection:bg-rose-500/30">
+    <div className="min-h-screen flex flex-col bg-zinc-100 dark:bg-zinc-950 text-foreground selection:bg-rose-500/30">
       {/* ambient glow */}
       <div className="pointer-events-none fixed inset-0 overflow-hidden">
         <div className="absolute -top-40 left-1/2 -translate-x-1/2 h-[420px] w-[680px] rounded-full bg-rose-600/15 blur-[120px]" />
@@ -354,15 +479,16 @@ export default function Home() {
             </div>
             <div className="leading-tight">
               <div className="font-bold tracking-tight text-[17px]">TuneLoad</div>
-              <div className="text-[11px] text-zinc-500 font-medium">YouTube to MP3</div>
+              <div className="text-[11px] text-muted-foreground/80 font-medium">YouTube to MP3</div>
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <Badge variant="outline" className="hidden sm:inline-flex border-zinc-800 bg-zinc-900/60 text-zinc-400 gap-1.5">
-              <Zap className="h-3 w-3 text-rose-400" /> 320 kbps
+            <Badge variant="outline" className="hidden sm:inline-flex border-border bg-card/60 text-muted-foreground gap-1.5">
+              <Zap className="h-3 w-3 text-rose-600 dark:text-rose-400" /> 320 kbps
             </Badge>
+            <ThemeToggle />
             <a href="/admin" aria-label="Admin">
-              <Button variant="outline" size="sm" className="border-zinc-800 bg-zinc-900/60 hover:bg-zinc-800 hover:text-white gap-1.5">
+              <Button variant="outline" size="sm" className="border-border bg-card/60 hover:bg-secondary hover:text-foreground gap-1.5">
                 <Settings2 className="h-4 w-4" /> <span className="hidden sm:inline">Admin</span>
               </Button>
             </a>
@@ -374,15 +500,15 @@ export default function Home() {
       <main className="relative z-10 flex-1 mx-auto w-full max-w-5xl px-4 sm:px-6 pb-24">
         {/* hero + input */}
         <section className="pt-10 sm:pt-16 pb-8 sm:pb-10 text-center">
-          <div className="inline-flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900/60 px-3.5 py-1.5 text-xs font-medium text-zinc-400 mb-5">
-            <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
+          <div className="inline-flex items-center gap-2 rounded-full border border-border bg-card/60 px-3.5 py-1.5 text-xs font-medium text-muted-foreground mb-5">
+            <ShieldCheck className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
             Playlist support · All qualities · No ads
           </div>
           <h1 className="text-3xl sm:text-5xl font-bold tracking-tight text-balance">
             Download YouTube audio as{" "}
             <span className="bg-gradient-to-r from-rose-400 to-orange-400 bg-clip-text text-transparent">MP3</span>
           </h1>
-          <p className="mt-3 text-zinc-400 text-sm sm:text-base max-w-xl mx-auto">
+          <p className="mt-3 text-muted-foreground text-sm sm:text-base max-w-xl mx-auto">
             Paste a video or playlist link. Fast, clean, high quality.
           </p>
 
@@ -395,13 +521,13 @@ export default function Home() {
               className="flex flex-col sm:flex-row gap-2.5"
             >
               <div className="relative flex-1">
-                <Link2 className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-600" />
+                <Link2 className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground/70" />
                 <Input
                   ref={inputRef}
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
                   placeholder="https://youtube.com/watch?v=… or playlist link"
-                  className="h-12 pl-10 pr-4 text-[15px] bg-zinc-900/80 border-zinc-800 focus-visible:ring-rose-500/50 focus-visible:border-rose-600/60 placeholder:text-zinc-600"
+                  className="h-12 pl-10 pr-4 text-[15px] bg-card/80 border-border focus-visible:ring-rose-500/50 focus-visible:border-rose-600/60 placeholder:text-muted-foreground/70"
                 />
               </div>
               <div className="flex gap-2.5">
@@ -409,7 +535,7 @@ export default function Home() {
                   type="button"
                   variant="outline"
                   onClick={pasteFromClipboard}
-                  className="h-12 px-4 border-zinc-800 bg-zinc-900/80 hover:bg-zinc-800 hover:text-white"
+                  className="h-12 px-4 border-border bg-card/80 hover:bg-secondary hover:text-white"
                 >
                   <ClipboardPaste className="h-4 w-4 sm:mr-1.5" />
                   <span className="hidden sm:inline">Paste</span>
@@ -427,7 +553,7 @@ export default function Home() {
           </div>
 
           {/* quality selector */}
-          <div className="mt-5 inline-flex flex-wrap justify-center gap-1 max-w-full rounded-xl border border-zinc-800 bg-zinc-900/60 p-1">
+          <div className="mt-5 inline-flex flex-wrap justify-center gap-1 max-w-full rounded-xl border border-border bg-card/60 p-1">
             {BITRATES.map((b) => (
               <button
                 key={b}
@@ -435,7 +561,7 @@ export default function Home() {
                 className={`px-3 sm:px-4 py-1.5 rounded-lg text-sm font-semibold transition-all ${
                   bitrate === b
                     ? "bg-rose-600 text-white shadow shadow-rose-900/50"
-                    : "text-zinc-400 hover:text-zinc-200"
+                    : "text-muted-foreground hover:text-foreground"
                 }`}
                 aria-pressed={bitrate === b}
               >
@@ -448,13 +574,13 @@ export default function Home() {
         {/* loading skeleton */}
         {loading && (
           <section className="mx-auto max-w-3xl">
-            <div className="rounded-2xl border border-zinc-800 bg-zinc-900/50 p-4 animate-pulse">
+            <div className="rounded-2xl border border-border bg-card/50 p-4 animate-pulse">
               <div className="flex gap-4">
-                <div className="h-20 w-36 rounded-lg bg-zinc-800" />
+                <div className="h-20 w-36 rounded-lg bg-secondary" />
                 <div className="flex-1 space-y-2.5 py-1">
-                  <div className="h-4 w-3/4 rounded bg-zinc-800" />
-                  <div className="h-3 w-1/3 rounded bg-zinc-800" />
-                  <div className="h-3 w-1/4 rounded bg-zinc-800" />
+                  <div className="h-4 w-3/4 rounded bg-secondary" />
+                  <div className="h-3 w-1/3 rounded bg-secondary" />
+                  <div className="h-3 w-1/4 rounded bg-secondary" />
                 </div>
               </div>
             </div>
@@ -474,7 +600,7 @@ export default function Home() {
               />
             </div>
             {dl[info.track.videoId]?.hint && (
-              <p className="mt-3 text-center text-xs text-zinc-500 max-w-lg mx-auto">{dl[info.track.videoId]?.hint}</p>
+              <p className="mt-3 text-center text-xs text-muted-foreground/80 max-w-lg mx-auto">{dl[info.track.videoId]?.hint}</p>
             )}
           </section>
         )}
@@ -483,14 +609,14 @@ export default function Home() {
         {info?.type === "playlist" && !loading && (
           <section className="mx-auto max-w-3xl">
             {/* playlist header */}
-            <div className="rounded-2xl border border-zinc-800 bg-gradient-to-b from-zinc-900/90 to-zinc-900/40 p-5">
+            <div className="rounded-2xl border border-border bg-gradient-to-b from-card/90 to-card/40 p-5">
               <div className="flex items-start gap-4">
-                <div className="h-14 w-14 shrink-0 rounded-xl bg-gradient-to-br from-rose-600/80 to-red-800/60 grid place-items-center border border-zinc-700/50">
+                <div className="h-14 w-14 shrink-0 rounded-xl bg-gradient-to-br from-rose-600/80 to-red-800/60 grid place-items-center border border-border/50">
                   <ListMusic className="h-6 w-6 text-white" />
                 </div>
                 <div className="flex-1 min-w-0">
                   <h2 className="text-lg font-bold tracking-tight truncate">{info.title}</h2>
-                  <p className="text-sm text-zinc-500 mt-0.5 truncate">
+                  <p className="text-sm text-muted-foreground/80 mt-0.5 truncate">
                     {info.author} · {info.trackCount} tracks · {selected.size} selected
                   </p>
                 </div>
@@ -513,14 +639,14 @@ export default function Home() {
                 <Button
                   variant="outline"
                   onClick={() => setSelected(new Set(tracks.map((t) => t.videoId)))}
-                  className="border-zinc-800 bg-zinc-900/60 hover:bg-zinc-800 hover:text-white"
+                  className="border-border bg-card/60 hover:bg-secondary hover:text-white"
                 >
                   Select all
                 </Button>
                 <Button
                   variant="outline"
                   onClick={() => setSelected(new Set())}
-                  className="border-zinc-800 bg-zinc-900/60 hover:bg-zinc-800 hover:text-white"
+                  className="border-border bg-card/60 hover:bg-secondary hover:text-white"
                 >
                   Clear
                 </Button>
@@ -536,7 +662,7 @@ export default function Home() {
             </div>
 
             {/* track list */}
-            <div className="mt-4 rounded-2xl border border-zinc-800 bg-zinc-900/40 divide-y divide-zinc-800/70 max-h-[520px] overflow-y-auto scroll-smooth tune-scroll">
+            <div className="mt-4 rounded-2xl border border-border bg-card/40 divide-y divide-zinc-800/70 max-h-[520px] overflow-y-auto scroll-smooth tune-scroll">
               {info.tracks.map((t, i) => (
                 <TrackRow
                   key={t.videoId}
@@ -561,10 +687,10 @@ export default function Home() {
               { icon: Gauge, t: "Fast engine", d: "Direct audio streams, parallel providers, no waiting rooms" },
               { icon: Music4, t: "High quality", d: "Up to 320 kbps MP3 with proper ID3 tags" },
             ].map((f) => (
-              <div key={f.t} className="rounded-2xl border border-zinc-800/80 bg-zinc-900/40 p-4">
-                <f.icon className="h-5 w-5 text-rose-400" />
+              <div key={f.t} className="rounded-2xl border border-border/80 bg-card/40 p-4">
+                <f.icon className="h-5 w-5 text-rose-600 dark:text-rose-400" />
                 <div className="mt-2.5 font-semibold text-sm">{f.t}</div>
-                <div className="mt-1 text-xs leading-relaxed text-zinc-500">{f.d}</div>
+                <div className="mt-1 text-xs leading-relaxed text-muted-foreground/80">{f.d}</div>
               </div>
             ))}
           </section>
@@ -572,12 +698,12 @@ export default function Home() {
       </main>
 
       {/* footer (sticky) */}
-      <footer className="relative z-10 mt-auto border-t border-zinc-800/60 bg-zinc-950/80 backdrop-blur">
-        <div className="mx-auto max-w-5xl px-4 sm:px-6 py-3 sm:py-0 sm:h-14 flex flex-col sm:flex-row items-center justify-center sm:justify-between gap-1 text-xs text-zinc-600 text-center">
-          <span className="font-medium text-zinc-500">TuneLoad</span>
+      <footer className="relative z-10 mt-auto border-t border-border/60 bg-zinc-100/80 dark:bg-zinc-950/80 backdrop-blur">
+        <div className="mx-auto max-w-5xl px-4 sm:px-6 py-3 sm:py-0 sm:h-14 flex flex-col sm:flex-row items-center justify-center sm:justify-between gap-1 text-xs text-muted-foreground/70 text-center">
+          <span className="font-medium text-muted-foreground/80">TuneLoad</span>
           <span className="flex items-center gap-3">
             <span>Audio falls under YouTube ToS — for personal use only</span>
-            <a href="/admin" className="underline hover:text-zinc-400">Admin</a>
+            <a href="/admin" className="underline hover:text-muted-foreground">Admin</a>
           </span>
         </div>
       </footer>
@@ -591,25 +717,25 @@ export default function Home() {
 
 function TrackCard({ track, big }: { track: Track; big?: boolean }) {
   return (
-    <div className="rounded-2xl border border-zinc-800 bg-zinc-900/50 overflow-hidden">
+    <div className="rounded-2xl border border-border bg-card/50 overflow-hidden">
       <div className={`flex gap-3 sm:gap-4 ${big ? "p-3 sm:p-4" : "p-3"}`}>
         <img
           src={track.thumbnail}
           alt={track.title}
-          className={`rounded-xl object-cover border border-zinc-800 ${big ? "h-20 w-36 sm:h-24 sm:w-44" : "h-16 w-28"}`}
+          className={`rounded-xl object-cover border border-border ${big ? "h-20 w-36 sm:h-24 sm:w-44" : "h-16 w-28"}`}
           loading="lazy"
         />
         <div className="flex-1 min-w-0 flex flex-col justify-center">
           <h3 className={`font-bold tracking-tight leading-snug ${big ? "text-sm sm:text-lg" : "text-sm"} line-clamp-2`}>
             {track.title}
           </h3>
-          <p className="text-sm text-zinc-500 mt-1 truncate flex items-center gap-1.5">
+          <p className="text-sm text-muted-foreground/80 mt-1 truncate flex items-center gap-1.5">
             <span className="truncate">{track.author}</span>
             {track.duration && (
-              <span className="shrink-0 text-zinc-600 font-mono tabular-nums">· {track.duration}</span>
+              <span className="shrink-0 text-muted-foreground/70 font-mono tabular-nums">· {track.duration}</span>
             )}
           </p>
-          <Badge variant="outline" className="mt-2 w-fit hidden sm:inline-flex border-zinc-700/60 bg-zinc-800/40 text-[10px] text-zinc-400 font-mono">
+          <Badge variant="outline" className="mt-2 w-fit hidden sm:inline-flex border-border/60 bg-secondary/40 text-[10px] text-muted-foreground font-mono">
             {track.videoId}
           </Badge>
         </div>
@@ -676,46 +802,46 @@ function TrackRow({
   const done = state?.status === "done";
   const err = state?.status === "error";
   return (
-    <div className="flex items-center gap-2 sm:gap-3 px-2.5 sm:px-3.5 py-2.5 hover:bg-zinc-900/70 transition-colors">
+    <div className="flex items-center gap-2 sm:gap-3 px-2.5 sm:px-3.5 py-2.5 hover:bg-card/70 transition-colors">
       <Checkbox
         checked={checked}
         onCheckedChange={onToggle}
-        className="border-zinc-700 data-[state=checked]:bg-rose-600 data-[state=checked]:border-rose-600"
+        className="border-border data-[state=checked]:bg-rose-600 data-[state=checked]:border-rose-600"
         aria-label={`Select ${track.title}`}
       />
-      <span className="hidden sm:block w-6 text-right text-xs text-zinc-600 font-mono tabular-nums">{index}</span>
+      <span className="hidden sm:block w-6 text-right text-xs text-muted-foreground/70 font-mono tabular-nums">{index}</span>
       <img
         src={track.thumbnail}
         alt={track.title}
-        className="h-9 w-14 sm:h-10 sm:w-[70px] rounded-md object-cover border border-zinc-800 shrink-0"
+        className="h-9 w-14 sm:h-10 sm:w-[70px] rounded-md object-cover border border-border shrink-0"
         loading="lazy"
       />
       <div className="flex-1 min-w-0">
         <div className="text-sm font-medium leading-tight truncate">{track.title}</div>
-        <div className="text-xs text-zinc-500 truncate mt-0.5 flex items-center gap-1.5">
+        <div className="text-xs text-muted-foreground/80 truncate mt-0.5 flex items-center gap-1.5">
           <span className="truncate">{track.author}</span>
           {track.duration && (
-            <span className="shrink-0 text-zinc-600 font-mono tabular-nums">· {track.duration}</span>
+            <span className="shrink-0 text-muted-foreground/70 font-mono tabular-nums">· {track.duration}</span>
           )}
         </div>
         {err && state?.hint && (
-          <div className="text-[10px] text-red-400/80 truncate mt-0.5" title={state.hint}>
+          <div className="text-[10px] text-red-600/80 dark:text-red-400/80 truncate mt-0.5" title={state.hint}>
             {state.hint.slice(0, 90)}
           </div>
         )}
       </div>
 
       {queued && (
-        <div className="flex items-center gap-1.5 text-xs text-zinc-400 shrink-0">
+        <div className="flex items-center gap-1.5 text-xs text-muted-foreground shrink-0">
           <Clock3 className="h-3.5 w-3.5 animate-pulse" />
         </div>
       )}
       {state?.status === "downloading" && (
-        <div className="flex items-center gap-1.5 text-xs text-zinc-400 shrink-0 tabular-nums">
+        <div className="flex items-center gap-1.5 text-xs text-muted-foreground shrink-0 tabular-nums">
           {state.pct != null ? (
             <>
-              <span className="text-rose-300 font-semibold">{Math.round(state.pct)}%</span>
-              {state.speed && <span className="hidden sm:inline text-zinc-500">{state.speed}</span>}
+              <span className="text-rose-700 dark:text-rose-300 font-semibold">{Math.round(state.pct)}%</span>
+              {state.speed && <span className="hidden sm:inline text-muted-foreground/80">{state.speed}</span>}
             </>
           ) : (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -723,18 +849,18 @@ function TrackRow({
         </div>
       )}
       {done && (
-        <div className="flex items-center gap-2 text-[11px] text-emerald-400/90 font-medium shrink-0">
+        <div className="flex items-center gap-2 text-[11px] text-emerald-600/90 dark:text-emerald-400/90 font-medium shrink-0">
           <CheckCircle2 className="h-3.5 w-3.5" />
           <span className="hidden sm:inline tabular-nums">{state?.sizeKB}KB</span>
           {state?.ms != null && (
-            <span className="hidden sm:inline-flex items-center gap-0.5 text-zinc-600 font-normal">
+            <span className="hidden sm:inline-flex items-center gap-0.5 text-muted-foreground/70 font-normal">
               <Clock3 className="h-3 w-3" /> {(state.ms / 1000).toFixed(1)}s
             </span>
           )}
         </div>
       )}
       {err && (
-        <div className="flex items-center gap-1.5 text-xs text-red-400 shrink-0" title={state?.hint}>
+        <div className="flex items-center gap-1.5 text-xs text-red-600 dark:text-red-400 shrink-0" title={state?.hint}>
           <XCircle className="h-4 w-4" />
         </div>
       )}
@@ -746,9 +872,9 @@ function TrackRow({
         disabled={busy}
         className={
           done
-            ? "h-8 px-2.5 sm:px-3 border-zinc-700 bg-zinc-800/40 hover:bg-zinc-800 hover:text-white"
+            ? "h-8 px-2.5 sm:px-3 border-border bg-secondary/40 hover:bg-secondary hover:text-white"
             : err
-              ? "h-8 px-2.5 sm:px-3 border-amber-800/60 bg-amber-950/40 hover:bg-amber-900/40 text-amber-300"
+              ? "h-8 px-2.5 sm:px-3 border-amber-300 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-950/40 hover:bg-amber-100 dark:hover:bg-amber-900/40 text-amber-700 dark:text-amber-300"
               : "h-8 px-2.5 sm:px-3 bg-rose-600 hover:bg-rose-500 text-white"
         }
       >
