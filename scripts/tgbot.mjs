@@ -33,7 +33,16 @@ const ROOT = process.cwd();
 const CFG_FILE = path.join(ROOT, "data", "tgbot.json");
 const LOG_FILE = path.join(ROOT, "data", "tgbot.log");
 const PID_FILE = path.join(ROOT, "data", "tgbot.pid");
+/** per-chat settings persist across bot restarts: { "chatId": { mode, quality, queue } } */
+let STATE_FILE = process.env.TG_STATE_FILE || path.join(ROOT, "data", "tgbot-state.json");
+/** test hook: point the state file somewhere else (isolated per test case) */
+export function _test_stateFile(newPath) {
+  if (newPath) STATE_FILE = newPath;
+  return STATE_FILE;
+}
 
+// Telegram Bot API base (override for tests; production default unchanged)
+const TG_BASE = (process.env.TG_API_BASE || "https://api.telegram.org").replace(/\/$/, "");
 const API_BASE = process.env.TUNELOAD_API_BASE || `http://127.0.0.1:${process.env.PORT || 3000}`;
 const FFMPEG_BIN = process.env.FFMPEG_BIN || "ffmpeg";
 const FFPROBE_BIN = process.env.FFPROBE_BIN || path.join(path.dirname(FFMPEG_BIN), "ffprobe");
@@ -49,6 +58,58 @@ const log = (msg) => {
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ------------------------------------------------------------------ */
+/* per-chat settings persistence (mode + quality survive restarts)     */
+/* ------------------------------------------------------------------ */
+
+function loadChatState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveChatState(chatId, patch) {
+  try {
+    const st = loadChatState();
+    const k = String(chatId);
+    st[k] = { ...(st[k] ?? {}), ...patch };
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify(st, null, 2), { mode: 0o600 });
+    log(`chat ${k} state saved: mode=${st[k].mode} quality=${st[k].quality} queue=${(st[k].queue ?? []).length}`);
+  } catch { /* noop */ }
+}
+
+/**
+ * MULTI-USER crash safety: every chat's pending queue is persisted next to its
+ * mode/quality. If the bot (or the whole server) dies mid-queue, the queue is
+ * rebuilt and RESUMED automatically on the next boot.
+ */
+function saveQueueState(chatId, queue) {
+  saveChatState(chatId, {
+    queue: (queue ?? []).slice(0, 200).map((j) => ({
+      v: j.track.videoId,
+      t: j.track.title,
+      a: j.track.author,
+      d: j.track.duration ?? null,
+      q: j.quality,
+    })),
+  });
+}
+
+/** stored queue rows → real queue jobs (drop anything malformed) */
+function reviveQueue(rows) {
+  if (!Array.isArray(rows)) return [];
+  const out = [];
+  for (const r of rows) {
+    if (r && typeof r.v === "string" && /^[a-zA-Z0-9_-]{11}$/.test(r.v) && QUALITIES.includes(r.q)) {
+      out.push({ track: { videoId: r.v, title: String(r.t ?? r.v), author: String(r.a ?? ""), duration: r.d ?? null }, quality: r.q });
+    }
+  }
+  return out;
+}
 
 /* ------------------------------------------------------------------ */
 /* youtube url parsing (JS port of src/lib/ytd/providers.ts)           */
@@ -165,18 +226,50 @@ export function splitIntoParts(file, size, duration) {
 /* ------------------------------------------------------------------ */
 
 export function realDeps(token) {
-  return {
-    tgCall: async (method, params) => {
-      const r = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(params ?? {}),
-        signal: AbortSignal.timeout(30_000),
-      });
+  const TG_DEBUG = process.env.TG_DEBUG === "1";
+  // Telegram rate limits (HTTP 429 + retry_after) and transient 5xx answers get
+  // automatic retries with backoff — a busy bot must never silently drop
+  // messages just because it talked too fast for a moment.
+  const tgFetch = async (method, params, fileBody = null, attempt = 1) => {
+    const MAX_ATTEMPTS = 4;
+    try {
+      const init = fileBody
+        ? { method: "POST", body: fileBody, signal: AbortSignal.timeout(120_000) }
+        : {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(params ?? {}),
+            signal: AbortSignal.timeout(30_000),
+          };
+      const t0 = Date.now();
+      const r = await fetch(`${TG_BASE}/bot${token}/${method}`, init);
       const j = await r.json().catch(() => ({ ok: false, description: `HTTP ${r.status}` }));
-      if (!j.ok) throw new Error(`tg ${method}: ${j.description ?? r.status}`);
+      if (TG_DEBUG) log(`tgCall ${method} → ${r.ok ? "ok" : `FAIL (${j.description ?? r.status})`} in ${Date.now() - t0}ms`);
+      if (!j.ok) {
+        const ra = Number(j.parameters?.retry_after) || 0;
+        if ((j.error_code === 429 || ra > 0) && attempt < MAX_ATTEMPTS) {
+          const wait = Math.min(20, ra || 2) * 1000 + 250;
+          log(`tg ${method}: rate limited — retry ${attempt + 1}/${MAX_ATTEMPTS} in ${Math.round(wait / 100) / 10}s`);
+          await sleep(wait);
+          return tgFetch(method, params, fileBody, attempt + 1);
+        }
+        if (r.status >= 500 && attempt < MAX_ATTEMPTS) {
+          await sleep(1200 * attempt);
+          return tgFetch(method, params, fileBody, attempt + 1);
+        }
+        throw new Error(`tg ${method}: ${j.description ?? r.status}`);
+      }
       return j.result;
-    },
+    } catch (e) {
+      if (TG_DEBUG && !/^tg /.test(String(e.message))) {
+        log(`tgCall ${method} error: ${e.message}`);
+      }
+      throw e;
+    }
+  };
+
+  return {
+    tgCall: async (method, params) => tgFetch(method, params),
 
     sendAudio: async (chatId, filePath, meta) => {
       const buf = fs.readFileSync(filePath);
@@ -187,14 +280,7 @@ export function realDeps(token) {
       if (meta.author) fd.append("performer", String(meta.author).slice(0, 64));
       const caption = `${meta.title}${meta.part ? ` · ${meta.part}` : ""} · ${meta.bitrate}kbps · TuneLoad`;
       fd.append("caption", caption.slice(0, 900));
-      const r = await fetch(`https://api.telegram.org/bot${token}/sendAudio`, {
-        method: "POST",
-        body: fd,
-        signal: AbortSignal.timeout(120_000),
-      });
-      const j = await r.json().catch(() => ({ ok: false }));
-      if (!j.ok) throw new Error(`tg sendAudio: ${j.description ?? r.status}`);
-      return j.result;
+      return tgFetch("sendAudio", { chat_id: String(chatId) }, fd);
     },
 
     api: async (route, body) => {
@@ -206,9 +292,32 @@ export function realDeps(token) {
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify(body),
             };
-      const r = await fetch(`${API_BASE}${route}`, init);
-      const data = await r.json().catch(() => ({}));
-      return { ok: r.ok, status: r.status, data };
+      // route-aware timeout + one retry: a hung engine request must never wedge
+      // the bot (fetch-audio legitimately runs minutes; everything else is fast)
+      const isLong = route.includes("fetch-audio");
+      const timeoutMs = isLong ? 330_000 : 30_000;
+      const DEBUG = process.env.TG_DEBUG === "1";
+      const attempt = async (n) => {
+        const t0 = Date.now();
+        try {
+          if (DEBUG) log(`api → ${route} (try ${n})`);
+          const r = await fetch(`${API_BASE}${route}`, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+          const data = await r.json().catch(() => ({}));
+          const ms = Date.now() - t0;
+          if (ms > 8_000) log(`slow api ${route}: ${ms}ms`);
+          else if (DEBUG) log(`api ← ${route} ${r.status} in ${ms}ms`);
+          return { ok: r.ok, status: r.status, data };
+        } catch (e) {
+          log(`api ${route} error after ${Date.now() - t0}ms (try ${n}): ${e.message}`);
+          return { ok: false, status: 0, data: { error: `engine unreachable: ${e.message}` } };
+        }
+      };
+      let res = await attempt(1);
+      if (res.status === 0 && !isLong) {
+        await sleep(800);
+        res = await attempt(2);
+      }
+      return res;
     },
 
     removeFile: (p) => {
@@ -230,10 +339,11 @@ const HELP = [
   "Send any YouTube link — video or playlist. Everything else is buttons:",
   "• quality → tap 320 / 256 / 192 / 128",
   "• playlist tracks → tap numbers to select, then Download",
+  "• download mode → 🤖 Auto (ask per link) or ✋ Manual (link = instant download)",
   "• live progress while downloading, Cancel anytime",
   "• sending another link while busy → it's queued automatically",
   "",
-  "Handy commands: /cancel (queue panel) · /status · /help",
+  "Handy commands: /mode (auto/manual) · /quality · /cancel (queue panel) · /status · /help",
   "Big tracks (>50MB) arrive as ≤50MB parts — unlimited total size.",
 ].join("\n");
 
@@ -247,16 +357,46 @@ function kb(rows) {
 }
 const B = (text, data) => ({ text, callback_data: data });
 
+const modeBtn = (sess) =>
+  B(
+    sess.mode === "manual"
+      ? "✋ Download mode: MANUAL — tap for Auto"
+      : "🤖 Download mode: AUTO — tap for Manual",
+    "mode"
+  );
+
+const modeText = (sess) =>
+  sess.mode === "manual"
+    ? [
+        "✋ MANUAL download mode is ON.",
+        "",
+        `Every YouTube link you send starts downloading INSTANTLY at ${sess.quality}kbps —`,
+        "• video → downloads right away, no quality question",
+        "• playlist → ALL tracks queue up automatically",
+        "",
+        "Set the quality with /quality (or tap below). No confirmations anymore.",
+      ].join("\n")
+    : [
+        "🤖 AUTO download mode is ON (default).",
+        "",
+        "Every link asks you first: video → pick quality; playlist → pick tracks.",
+        "Tap the button below to switch to MANUAL (link = instant download).",
+      ].join("\n");
+
 export function createBot(deps) {
   /** chatId → session */
   const sessions = new Map();
+  const chatStore = loadChatState();
   const getSession = (chatId) => {
     if (!sessions.has(chatId)) {
+      const stored = chatStore[String(chatId)] ?? {};
       sessions.set(chatId, {
-        quality: 320,        // default quality (sticky, chosen via buttons)
+        chatId, // sessions know their own chat (queue persistence needs it)
+        quality: QUALITIES.includes(stored.quality) ? stored.quality : 320,
+        mode: stored.mode === "manual" ? "manual" : "auto", // 🤖 auto | ✋ manual
         picker: null,        // { tracks, selected:Set, page }
         pendingVideo: null,  // { track } awaiting quality choice
-        queue: [],           // [{ track, quality }]
+        queue: reviveQueue(stored.queue), // restored after a crash/restart
         active: null,        // { track, quality } the job currently downloading
         lastFailed: [],      // [{ track, quality }] for the Retry button
         cancelRequested: false,
@@ -273,12 +413,17 @@ export function createBot(deps) {
     );
 
   const editMsg = async (chatId, messageId, text, markup) => {
+    // accept BOTH shapes — some call sites pass kb(...) directly, others pass
+    // { reply_markup: kb(...) }; a double-wrapped keyboard makes the REAL
+    // Telegram API reject the edit with "Bad Request: can't parse inline
+    // keyboard", which silently killed every picker update in production.
+    const rm = markup?.inline_keyboard ? markup : (markup?.reply_markup ?? null);
     try {
       await deps.tgCall("editMessageText", {
         chat_id: chatId,
         message_id: messageId,
         text,
-        ...(markup ? { reply_markup: markup } : {}),
+        ...(rm ? { reply_markup: rm } : {}),
       });
     } catch (e) {
       const m = String(e.message);
@@ -295,6 +440,7 @@ export function createBot(deps) {
 
   const qualityRows = (sess) => [
     QUALITIES.map((q) => B(`${sess.quality === q ? "✓ " : ""}${q} kbps`, `q:${q}`)),
+    [modeBtn(sess)],
     [B("✖ Cancel", "cx")],
   ];
 
@@ -328,6 +474,7 @@ export function createBot(deps) {
     const count = p.selected.size || n;
     rows.push([B(`⬇ Download ${count}`, "go")]);
     rows.push([B(`🎚 ${sess.quality} kbps`, "qual"), B("✖ Cancel", "cx")]);
+    rows.push([modeBtn(sess)]);
     return rows;
   };
 
@@ -369,8 +516,22 @@ export function createBot(deps) {
 
   /* ---------------- queue + runner ---------------- */
 
+  // MULTI-USER: the engine caches/dedupes per videoId+bitrate, so two chats
+  // asking for the SAME track share one engine job. Killing that job because
+  // ONE user tapped Cancel would murder the other user's download too — so
+  // only send the engine cancel when nobody else is still using the key.
+  function jobKeyBusyElsewhere(selfChatId, videoId, quality) {
+    for (const [cid, s] of sessions) {
+      if (cid === selfChatId) continue;
+      if (s.active && s.active.track?.videoId === videoId && s.active.quality === quality) return true;
+      if (s.queue.some((j) => j.track.videoId === videoId && j.quality === quality)) return true;
+    }
+    return false;
+  }
+
   function enqueue(sess, jobs) {
     sess.queue.push(...jobs);
+    saveQueueState(sess.chatId, sess.queue); // crash-safe: persisted immediately
   }
 
   function pump(chatId) {
@@ -390,6 +551,7 @@ export function createBot(deps) {
       while (sess.queue.length > 0) {
         if (sess.cancelRequested) break;
         const job = sess.queue.shift();
+        saveQueueState(sess.chatId, sess.queue); // job left the queue → persist
         const total = done + 1 + sess.queue.length;
         sess.active = { track: job.track, quality: job.quality };
         sess.editAt = 0;
@@ -422,6 +584,7 @@ export function createBot(deps) {
 
     // summary
     const rest = sess.queue.splice(0);
+    saveQueueState(sess.chatId, sess.queue); // drained/cancelled → persist empty
     const skippedAll = [...skipped, ...rest];
     sess.cancelRequested = false;
 
@@ -504,23 +667,37 @@ export function createBot(deps) {
         throw new Error(res.data?.hint || res.data?.error || `HTTP ${res.status}`);
       }
       const { path: file, filename, bitrate } = res.data;
+      // MULTI-USER: the engine may hand the SAME cached file to several chats
+      // (dedupe per videoId+bitrate). The first chat that finishes deletes the
+      // server copy — the next chat would then send a vanished file. So every
+      // job works on its OWN temp copy in its OWN directory, deleted after send.
+      let tmpDir = null;
       try {
-        if (statusMsgId) {
-          sess.editAt = Date.now();
-          await editMsg(chatId, statusMsgId, `📤 ${posLabel} · ${title}\n📤 sending to Telegram…`);
+        tmpDir = fs.mkdtempSync(path.join(path.dirname(file), "job-"));
+        const privateFile = path.join(tmpDir, filename.replace(/[\\/:*?"<>|]+/g, "_"));
+        fs.copyFileSync(file, privateFile);
+        try {
+          if (statusMsgId) {
+            sess.editAt = Date.now();
+            await editMsg(chatId, statusMsgId, `📤 ${posLabel} · ${title}\n📤 sending to Telegram…`);
+          }
+          const partsSent = await sendMaybeChunked(chatId, privateFile, {
+            filename,
+            title: job.track.title,
+            author: job.track.author,
+            bitrate,
+          });
+          if (partsSent > 1 && statusMsgId) {
+            await editMsg(chatId, statusMsgId, `✅ ${posLabel} · ${title} — sent in ${partsSent} parts`);
+          }
+          return "ok";
+        } finally {
+          deps.removeFile(file); // auto-clean: engine cache copy deleted right after send
         }
-        const partsSent = await sendMaybeChunked(chatId, file, {
-          filename,
-          title: job.track.title,
-          author: job.track.author,
-          bitrate,
-        });
-        if (partsSent > 1 && statusMsgId) {
-          await editMsg(chatId, statusMsgId, `✅ ${posLabel} · ${title} — sent in ${partsSent} parts`);
-        }
-        return "ok";
       } finally {
-        deps.removeFile(file); // auto-clean: server copy deleted right after send
+        if (tmpDir) {
+          try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
+        }
       }
     } catch (e) {
       return String(e.message).slice(0, 160);
@@ -556,11 +733,41 @@ export function createBot(deps) {
 
   /* ---------------- link intake ---------------- */
 
-  async function handleLink(chatId, url) {
+  async function handleLink(chatId, url, placeholderId = null) {
     const sess = getSession(chatId);
     const info = await deps.api("/api/info", { url });
     if (!info.ok) throw new Error(info.data?.error || "Could not read that link");
     const d = info.data;
+
+    /* ✋ MANUAL mode: link → download starts INSTANTLY with the saved quality.
+       No quality question, no track picker — exactly like a downloader bot. */
+    if (sess.mode === "manual") {
+      const q = sess.quality;
+      if (d.type === "video") {
+        const t = d.track;
+        const busy = !!(sess.active || sess.queue.length);
+        enqueue(sess, [{ track: t, quality: q }]);
+        await send(
+          chatId,
+          `✋ Manual mode · ${q}kbps — download ${busy ? "queued" : "started"}:\n🎵 ${t.title}\n👤 ${t.author}`
+        );
+        pump(chatId);
+        return;
+      }
+      const tracks = d.tracks ?? [];
+      if (!tracks.length) throw new Error("Playlist came back empty — try a different link");
+      const cap = 100; // safety valve for mega-playlists
+      const list = tracks.slice(0, cap);
+      enqueue(
+        sess,
+        list.map((t) => ({ track: t, quality: q }))
+      );
+      const msg = `✋ Manual mode · ${q}kbps — queueing ALL ${list.length}${tracks.length > cap ? ` (of ${tracks.length})` : ""} tracks:\n📋 ${d.title}`;
+      if (placeholderId) await editMsg(chatId, placeholderId, msg);
+      else await send(chatId, msg);
+      pump(chatId);
+      return;
+    }
 
     if (d.type === "video") {
       const t = d.track;
@@ -577,7 +784,7 @@ export function createBot(deps) {
       return;
     }
 
-    // playlist → interactive picker
+    // playlist → interactive picker (turn the ⏳ placeholder into the picker)
     const tracks = d.tracks ?? [];
     if (!tracks.length) throw new Error("Playlist came back empty — try a different link");
     sess.picker = {
@@ -587,7 +794,11 @@ export function createBot(deps) {
       selected: new Set(),
       page: 0,
     };
-    await send(chatId, pickerText(sess), { reply_markup: kb(pickerRows(sess)) });
+    if (placeholderId) {
+      await editMsg(chatId, placeholderId, pickerText(sess), { reply_markup: kb(pickerRows(sess)) });
+    } else {
+      await send(chatId, pickerText(sess), { reply_markup: kb(pickerRows(sess)) });
+    }
   }
 
   /* ---------------- callback routing ---------------- */
@@ -599,11 +810,14 @@ export function createBot(deps) {
     if (data === "cancel") {
       sess.cancelRequested = true;
       sess.cancelWasUser = true;
-      if (sess.active?.track) {
+      if (sess.active?.track && !jobKeyBusyElsewhere(chatId, sess.active.track.videoId, sess.active.quality)) {
+        // nobody else needs this engine job — kill it for real
         await deps
           .api("/api/cancel", { videoId: sess.active.track.videoId, bitrate: sess.active.quality })
           .catch(() => {});
       }
+      // (shared job: the other user's download keeps running; this chat just
+      // abandons the rest of its queue and stops showing progress)
       await answerCb(cbId);
       return;
     }
@@ -622,6 +836,7 @@ export function createBot(deps) {
     if (data.startsWith("rm:")) {
       const idx = Number(data.slice(3));
       const removed = sess.queue.splice(idx, 1)[0];
+      saveQueueState(sess.chatId, sess.queue);
       await answerCb(cbId);
       const panel = queuePanel(sess);
       await editMsg(chatId, messageId, `Removed: ${removed ? removed.track.title.slice(0, 50) : "—"}\n\n${panel.text}`, panel.markup);
@@ -638,11 +853,34 @@ export function createBot(deps) {
 
     if (data === "noop") return answerCb(cbId);
 
+    // download-mode toggle (the ONE button that flips Auto ↔ Manual)
+    if (data === "mode") {
+      sess.mode = sess.mode === "manual" ? "auto" : "manual";
+      saveChatState(chatId, { mode: sess.mode, quality: sess.quality });
+      await answerCb(cbId);
+      if (sess.picker) {
+        await editMsg(chatId, messageId, pickerText(sess), { reply_markup: kb(pickerRows(sess)) });
+      } else if (sess.pendingVideo) {
+        const t = sess.pendingVideo.track;
+        const note = sess.mode === "manual" ? "\n\n✋ Manual ON — next link downloads instantly." : "";
+        await editMsg(
+          chatId,
+          messageId,
+          `🎵 ${t.title}\n👤 ${t.author}${t.duration ? `\n⏱ ${t.duration}` : ""}${note}\n\nTap a quality to download:`,
+          { reply_markup: kb(qualityRows(sess)) }
+        );
+      } else {
+        await editMsg(chatId, messageId, modeText(sess), { reply_markup: kb([[modeBtn(sess)]]) });
+      }
+      return;
+    }
+
     // quality taps (work for pending video AND for the open picker)
     if (data.startsWith("q:")) {
       const q = Number(data.slice(2));
       if (!QUALITIES.includes(q)) return answerCb(cbId);
       sess.quality = q;
+      saveChatState(chatId, { quality: q, mode: sess.mode });
 
       if (sess.picker) {
         await answerCb(cbId);
@@ -651,17 +889,26 @@ export function createBot(deps) {
       }
       const pv = sess.pendingVideo;
       sess.pendingVideo = null;
-      await answerCb(cbId);
       if (pv) {
-        enqueue(sess, [{ track: pv.track, quality: q }]);
+        enqueue(sess, [{ track: pv.track, quality: q }]); // before awaits — cancel must see it
+        await answerCb(cbId);
         pump(chatId);
       } else {
-        await send(chatId, `🎚 Default quality set: ${q}kbps`);
+        await send(
+          chatId,
+          `🎚 Default quality set: ${q}kbps${sess.mode === "manual" ? " — links now download instantly (Manual mode)" : ""}`
+        );
       }
       return;
     }
 
-    // picker actions
+    // picker actions (with an expired-picker guard: analysis can take seconds,
+    // and a tap that lands before the picker exists must not be silently lost)
+    if (!sess.picker && /^(t:|all$|pgall$|p:|go$|qual$)/.test(data)) {
+      await answerCb(cbId);
+      await editMsg(chatId, messageId, "⌛ This track picker has expired — send the playlist link again.");
+      return;
+    }
     if (sess.picker) {
       const p = sess.picker;
       if (data.startsWith("t:")) {
@@ -703,9 +950,9 @@ export function createBot(deps) {
         const sel = p.selected.size ? [...p.selected].sort((a, b) => a - b) : p.tracks.map((_, i) => i);
         const jobs = sel.map((i) => ({ track: p.tracks[i], quality: sess.quality }));
         sess.picker = null;
+        enqueue(sess, jobs); // synchronously FIRST — a /cancel arriving mid-edit must see the queue
         await answerCb(cbId);
         await editMsg(chatId, messageId, `📦 ${sel.length} track${sel.length > 1 ? "s" : ""} · ${sess.quality}kbps — starting queue…`);
-        enqueue(sess, jobs);
         pump(chatId);
         return;
       }
@@ -721,7 +968,9 @@ export function createBot(deps) {
     const sess = getSession(chatId);
 
     if (/^\/start/.test(text)) {
-      return send(chatId, `👋 TuneLoad bot — buttons only, zero typing.\n\n${HELP}`);
+      return send(chatId, `👋 TuneLoad bot — buttons only, zero typing.\n\n${HELP}`, {
+        reply_markup: kb([[modeBtn(sess)]]),
+      });
     }
     if (/^\/help/.test(text)) {
       return send(chatId, HELP);
@@ -736,22 +985,50 @@ export function createBot(deps) {
       const r = await deps.api("/api/status");
       const d = r.data ?? {};
       const q = d.queue ?? {};
+      // REAL cookie verdicts (stored by the engine's YouTube probe) — honest
+      // per-set state, never a canned "armed" line
+      let cookieLine = "";
+      try {
+        const meta = JSON.parse(fs.readFileSync(path.join(ROOT, "data", "cookies", "sets.json"), "utf8"));
+        const rows = Object.entries(meta)
+          .sort((a, b) => Number(a[0]) - Number(b[0]))
+          .map(([id, m]) => {
+            const v = m?.verify;
+            if (!v) return `  set #${id} — ⏳ এখনো যাচাই হয়নি`;
+            const ago = Math.max(0, Math.round((Date.now() - new Date(v.at).getTime()) / 60000));
+            return v.ok
+              ? `  set #${id} — ✅ কাজ করছে (${ago}মিনিট আগে যাচাই)`
+              : `  set #${id} — ❌ বাদ (${v.kind === "auth" ? "YouTube reject" : v.kind}) · ${String(v.message).slice(0, 70)}`;
+          });
+        if (rows.length) cookieLine = `\nCookie sets (real):\n${rows.join("\n")}`;
+      } catch { /* no meta file — skip */ }
       return send(
         chatId,
-        `Engine: yt-dlp ${d.ytdlp ? "✅" : "❌"} · ffmpeg ${d.ffmpeg ? "✅" : "❌"} · cookie sets ${d.cookieSets ?? "—"}\nQueue: ${q.running ?? 0} running · ${q.waiting ?? 0} waiting\nDefault quality: ${sess.quality}kbps`
+        `Engine: yt-dlp ${d.ytdlp ? "✅" : "❌"} · ffmpeg ${d.ffmpeg ? "✅" : "❌"} · cookie sets ${d.cookieSets ?? "—"}\nQueue: ${q.running ?? 0} running · ${q.waiting ?? 0} waiting${cookieLine}\nDownload mode: ${sess.mode === "manual" ? "✋ Manual" : "🤖 Auto"} · Default quality: ${sess.quality}kbps`
       );
+    }
+
+    if (/^\/mode/.test(text)) {
+      return send(chatId, modeText(sess), { reply_markup: kb([[modeBtn(sess)]]) });
     }
 
     if (/^\/quality/.test(text)) {
       return send(chatId, "Tap a quality (also available on every link):", {
-        reply_markup: kb([QUALITIES.map((x) => B(`${x} kbps`, `q:${x}`))]),
+        reply_markup: kb([QUALITIES.map((x) => B(`${x} kbps`, `q:${x}`)), [modeBtn(sess)]]),
       });
     }
 
     const link = findYouTubeLink(text);
     if (link) {
       try {
-        await handleLink(chatId, link);
+        // playlists can take a while to analyze (full track list) — give the
+        // user instant feedback and turn the placeholder into the picker
+        const isPlaylist = /[?&]list=|\/playlist\?/.test(link);
+        let placeholder = null;
+        if (isPlaylist) {
+          placeholder = await send(chatId, "⏳ Reading the playlist — fetching the full track list…");
+        }
+        await handleLink(chatId, link, placeholder?.message_id ?? null);
       } catch (e) {
         await send(chatId, `⚠️ ${String(e.message).slice(0, 300)}`);
       }
@@ -759,6 +1036,20 @@ export function createBot(deps) {
     }
 
     return send(chatId, "Send me a YouTube link (video or playlist) — everything else is buttons.");
+  }
+
+  // CRASH RECOVERY: any chat that had a pending queue when the bot died gets
+  // it back — session is materialized (reviveQueue already ran), the user is
+  // told what happened, and the queue RESUMES immediately.
+  for (const [cid, st] of Object.entries(chatStore)) {
+    if (Array.isArray(st.queue) && st.queue.length) {
+      const sess = getSession(cid);
+      if (!sess.queue.length) continue; // nothing survived validation
+      deps
+        .log(`restoring ${sess.queue.length} queued track(s) for chat ${cid} after restart`);
+      send(cid, `🔄 Bot restarted — your queue (${sess.queue.length} track${sess.queue.length > 1 ? "s" : ""}) survived and is resuming now.`);
+      pump(cid);
+    }
   }
 
   return { handleText, handleCallback, sessions };
@@ -784,7 +1075,7 @@ async function main() {
 
   try { fs.writeFileSync(PID_FILE, String(process.pid)); } catch { /* noop */ }
 
-  const me = await fetch(`https://api.telegram.org/bot${token}/getMe`)
+  const me = await fetch(`${TG_BASE}/bot${token}/getMe`)
     .then((r) => r.json())
     .catch(() => null);
   if (!me?.ok) {
@@ -801,7 +1092,7 @@ async function main() {
     let res = null;
     try {
       const r = await fetch(
-        `https://api.telegram.org/bot${token}/getUpdates?timeout=25&offset=${offset}`,
+        `${TG_BASE}/bot${token}/getUpdates?timeout=25&offset=${offset}`,
         { signal: AbortSignal.timeout(35_000) }
       );
       res = await r.json();
@@ -816,6 +1107,7 @@ async function main() {
       await sleep(3000);
       continue;
     }
+    if (res.result?.length) log(`updates: ${res.result.length} delivered (offset ${offset})`);
     for (const u of res.result ?? []) {
       offset = u.update_id + 1;
 

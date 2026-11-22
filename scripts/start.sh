@@ -23,11 +23,13 @@ if [ -x bin/ffmpeg ]; then export FFMPEG_BIN="$APP_DIR/bin/ffmpeg"; fi
 if command -v yt-dlp >/dev/null 2>&1; then export YTDLP_BIN="$(command -v yt-dlp)"; fi
 if command -v ffmpeg >/dev/null 2>&1; then export FFMPEG_BIN="$(command -v ffmpeg)"; fi
 
-# yt-dlp's JS challenge solver needs node >= 22 — if system node is older, use the
-# bundled one (downloaded by .bd_boot.sh into bin/node22)
+# yt-dlp's JS challenge solver needs node >= 22 — if system node is older, put the
+# bundled one (downloaded by bd_boot.sh into bin/node22) FIRST ON PATH. The
+# "node:/dir" runtime spec is not accepted by every yt-dlp build; a PATH-resolved
+# node ≥22 works everywhere and is what the challenge solver picks up.
 SYS_NODE_MAJOR=$(node -v 2>/dev/null | cut -c2- | cut -d. -f1)
 if [ "${SYS_NODE_MAJOR:-0}" -lt 22 ] && [ -x "$APP_DIR/bin/node22/bin/node" ]; then
-  export YTDLP_JS_RUNTIME="node:$APP_DIR/bin/node22"
+  export PATH="$APP_DIR/bin/node22/bin:$PATH"
 fi
 export YTDLP_JS_RUNTIME="${YTDLP_JS_RUNTIME:-node}"
 
