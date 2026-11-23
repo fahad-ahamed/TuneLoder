@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import { Readable } from "stream";
 import { resolveAudio, convertToMp3 } from "@/lib/ytd/providers";
+import { updateJob, jobKey } from "@/lib/ytd/jobs";
 import { startSweeper, scheduleRemoval } from "@/lib/ytd/cleanup";
 
 export const runtime = "nodejs";
@@ -14,7 +15,8 @@ const ALLOWED_BITRATES = [320, 256, 192, 128, 96, 64];
 function safeName(s: string, fallback: string): string {
   const clean = s
     .normalize("NFKD")
-    .replace(/[^\p{L}\p{N} ()\-'.,&]/gu, "")
+    // \p{M} = vowel signs / combining marks — without it Bangla names lose their কার ("মন মাঝে" → "মন মঝ")
+    .replace(/[^\p{L}\p{N}\p{M} ()\-'.,&]/gu, "")
     .replace(/[\\/:*?"<>|]/g, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -85,8 +87,18 @@ export async function GET(req: NextRequest) {
     const nodeStream = fs.createReadStream(mp3File);
     const webStream = Readable.toWeb(nodeStream) as ReadableStream;
 
-    nodeStream.on("close", () => scheduleRemoval(mp3File!, 60_000));
-    nodeStream.on("error", () => scheduleRemoval(mp3File!, 60_000));
+    // honesty marker: fully streamed → delivered (UI shows "Sent ✓")
+    nodeStream.on("close", () => {
+      updateJob(jobKey(videoId, bitrate), { delivered: true });
+    });
+
+    // cache copies are owned by the sweeper TTL; temp/converted copies go now
+    const isCacheCopy = mp3File.startsWith(path.join(process.cwd(), "data", "audio"));
+    const cleanup = (ms: number) => {
+      if (!isCacheCopy) scheduleRemoval(mp3File!, ms);
+    };
+    nodeStream.on("close", () => cleanup(60_000));
+    nodeStream.on("error", () => cleanup(60_000));
 
     return new Response(webStream, {
       headers: {

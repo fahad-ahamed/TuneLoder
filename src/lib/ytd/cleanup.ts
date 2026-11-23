@@ -1,9 +1,11 @@
 /**
  * Auto-clean: downloads never pile up on the server.
  *
- *  - every served file is scheduled for deletion ~60s after the response
+ *  - served temp copies (.tmp-downloads) are deleted ~60s after the response
  *    finishes (short grace so a browser retry can still hit the cache)
- *  - a background sweeper deletes anything older than 30 min as a safety net
+ *  - the engine MP3 cache (data/audio) survives longer — default 60 min, set
+ *    via AUDIO_CACHE_TTL_MIN — so repeat downloads stay instant
+ *  - a background sweeper deletes anything past its age as a safety net
  *    (covers aborted streams, TG bot crashes, orphaned temp files)
  */
 
@@ -14,7 +16,9 @@ const PROJECT_ROOT = process.cwd();
 const AUDIO_DIR = path.join(PROJECT_ROOT, "data", "audio");
 const TMP_DIR = path.join(PROJECT_ROOT, ".tmp-downloads");
 const SWEEP_INTERVAL_MS = 10 * 60_000; // every 10 min
-const MAX_AGE_MS = 30 * 60_000; // anything older than 30 min goes
+const TMP_MAX_AGE_MS = 30 * 60_000; // temp copies: 30 min and gone
+const AUDIO_CACHE_TTL_MS =
+  Math.max(1, Number(process.env.AUDIO_CACHE_TTL_MIN) || 60) * 60_000; // cache: 60 min
 
 const g = globalThis as unknown as { __tuneloadSweeper?: boolean };
 
@@ -27,8 +31,13 @@ export function startSweeper() {
 }
 
 export function sweepNow() {
-  const cutoff = Date.now() - MAX_AGE_MS;
-  for (const dir of [AUDIO_DIR, TMP_DIR]) {
+  const tmpCutoff = Date.now() - TMP_MAX_AGE_MS;
+  const audioCutoff = Date.now() - AUDIO_CACHE_TTL_MS;
+  const dirs: Array<[string, number]> = [
+    [AUDIO_DIR, audioCutoff],
+    [TMP_DIR, tmpCutoff],
+  ];
+  for (const [dir, cutoff] of dirs) {
     let files: string[] = [];
     try {
       files = fs.readdirSync(dir);

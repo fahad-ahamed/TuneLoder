@@ -48,6 +48,12 @@ export async function POST(req: NextRequest) {
     }
     patch.delivery = body.delivery;
   }
+  if (body.playlistDelivery !== undefined) {
+    if (body.playlistDelivery !== "zip" && body.playlistDelivery !== "separate") {
+      return NextResponse.json({ error: "playlistDelivery must be 'zip' or 'separate'" }, { status: 400 });
+    }
+    patch.playlistDelivery = body.playlistDelivery;
+  }
   if (body.auth !== undefined && typeof body.auth === "object") {
     // per-key merge so a partial toggle patch never flips the other system
     patch.auth = {

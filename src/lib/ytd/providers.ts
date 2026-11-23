@@ -46,7 +46,8 @@ const COOKIE_STATE_FILE = path.join(COOKIE_DIR, "state.json");
 const COOKIE_META_FILE = path.join(COOKIE_DIR, "sets.json");
 
 const AUDIO_CACHE_DIR = path.join(PROJECT_ROOT, "data", "audio");
-const CACHE_CAP_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB
+export { AUDIO_CACHE_DIR };
+const CACHE_CAP_BYTES = 1024 * 1024 * 1024; // 1 GB hard cap (evict oldest first)
 
 const POT_PLUGIN_DIR = path.join(PROJECT_ROOT, "bgutil-ytdlp-pot-provider", "plugin");
 const POT_SERVER_DIR = path.join(PROJECT_ROOT, "bgutil-ytdlp-pot-provider", "server");
@@ -174,7 +175,7 @@ function readSetMeta(): Record<string, CookieSetMeta> {
   }
 }
 
-export function writeCookieSetMeta(id: number, meta: Partial<CookieSetMeta> & { origin: CookieSetOrigin }) {
+export function writeCookieSetMeta(id: number, meta: Partial<CookieSetMeta>) {
   try {
     fs.mkdirSync(COOKIE_DIR, { recursive: true });
     const all = readSetMeta();
@@ -346,16 +347,28 @@ function gate(): Gate {
 }
 const RUN_GAP_MS_DEFAULT = 700; // fallback breathing room (admin overrides live)
 
-async function withGate<T>(fn: () => Promise<T>): Promise<T> {
+async function withGate<T>(key: string | null, fn: () => Promise<T>): Promise<T> {
   const g = gate();
-  if (g.running >= g.max) {
-    await new Promise<void>((resolve) => g.queue.push(resolve));
+  // wait for a free slot; the wait itself is cancellable and re-checks the slot
+  // after every wake (a released waiter that lost the race loops instead of
+  // over-counting g.running — the old code incremented unconditionally)
+  for (;;) {
+    if (g.running < g.max) break;
+    const cancelled = key
+      ? await waitOrCancel(key, 500)
+      : await new Promise<boolean>((r) => setTimeout(() => r(false), 500));
+    if (cancelled) throw new Error("Cancelled");
   }
   g.running++;
   try {
     const gap = Math.max(RUN_GAP_MS_DEFAULT, getSettings().runGapMs);
     const wait = g.lastRunEnd + gap - Date.now();
-    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    if (wait > 0) {
+      const cancelled = key
+        ? await waitOrCancel(key, wait)
+        : await new Promise<boolean>((r) => setTimeout(() => r(false), wait));
+      if (cancelled) throw new Error("Cancelled");
+    }
     return await fn();
   } finally {
     g.running--;
@@ -419,6 +432,7 @@ export function cancelJob(videoId: string, bitrate: number): boolean {
   const key = jobKey(videoId, bitrate);
   cancelledSet().add(key);
   updateJob(key, { phase: "cancelled" });
+  wakeKey(key); // any wait (gate / breaker / backoff / cooldown) stops immediately
   const child = runners().get(key);
   if (!child) return true; // nothing running → treat as cancelled
   try { child.kill("SIGKILL"); } catch { /* noop */ }
@@ -430,6 +444,35 @@ function isCancelled(key: string): boolean {
 }
 function clearCancelled(key: string) {
   cancelledSet().delete(key);
+}
+
+/* cancellable waits — every "sleep" in the engine registers here so /api/cancel
+   wakes it the same instant instead of leaving the job hanging for 6-90 s */
+const gWaiters = globalThis as unknown as { __tlWaiters?: Map<string, Set<() => void>> };
+function waiters(): Map<string, Set<() => void>> {
+  return gWaiters.__tlWaiters ?? (gWaiters.__tlWaiters = new Map<string, Set<() => void>>());
+}
+function wakeKey(key: string) {
+  const set = waiters().get(key);
+  if (!set) return;
+  for (const w of set) w();
+  waiters().delete(key);
+}
+/** sleep up to `ms`; resolves true as soon as the key is cancelled, false on timeout */
+function waitOrCancel(key: string, ms: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (isCancelled(key)) return resolve(true);
+    const set = waiters().get(key) ?? waiters().set(key, new Set()).get(key)!;
+    const finish = (cancelled: boolean) => {
+      clearTimeout(t);
+      set.delete(fire);
+      if (set.size === 0) waiters().delete(key);
+      resolve(cancelled);
+    };
+    const fire = () => finish(true);
+    set.add(fire);
+    const t = setTimeout(() => finish(false), ms);
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -445,9 +488,16 @@ function runYtDlp(
   cookieAlt = false
 ): Promise<string> {
   const key = jobKey(videoId, bitrate);
-  clearCancelled(key); // fresh attempt
+  // NOTE: never clearCancelled() here — a cancel that landed while the job sat
+  // in the gate/backoff queue must stay honoured (the old code wiped the flag
+  // at the start of every fresh attempt, so a queued-then-cancelled job ran to
+  // completion anyway). resolveAudioInner (fresh user intent) owns the clear.
 
   return new Promise<string>((resolve, reject) => {
+    if (isCancelled(key)) {
+      cleanStrays(videoId, bitrate);
+      return reject(new Error("Cancelled"));
+    }
     fs.mkdirSync(AUDIO_CACHE_DIR, { recursive: true });
 
     const outTemplate = path.join(AUDIO_CACHE_DIR, `${videoId}-${bitrate}.%(ext)s`);
@@ -660,8 +710,38 @@ export type ResolvedAudio = {
   container?: string;
   cached?: boolean;
   cancelled?: boolean;
+  /** failure class for "provider: none": video | auth | rate | network | timeout | unknown */
+  kind?: string;
   logs: string[];
 };
+
+/* cheap existence probe: a missing video answers 404 at the thumbnail CDN,
+   a live one answers 200 — saves the 65-second multi-provider detour on
+   removed/wrong-ID requests (measured: hqdefault.jpg) */
+export async function videoExists(videoId: string): Promise<boolean | null> {
+  try {
+    const res = await fetch(`https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`, {
+      method: "HEAD",
+      signal: AbortSignal.timeout(6_000),
+    });
+    if (res.status === 404) return false;
+    if (res.ok) return true;
+    return null; // inconclusive (rate-limited CDN etc.) → let the chain decide
+  } catch {
+    return null;
+  }
+}
+
+/** terminal-failure classification from the last provider error messages */
+function classifyFailure(logs: string[]): string {
+  const joined = logs.join(" | ").slice(-600);
+  if (/timed out|timeout/i.test(joined)) return "timeout";
+  if (isVideoProblem(joined)) return "video";
+  if (isAuthFailure(joined)) return "auth";
+  if (isRateLimit(joined)) return "rate";
+  if (/fetch failed|network|ENOTFOUND|ECONNREFUSED|unreachable/i.test(joined)) return "network";
+  return "unknown";
+}
 
 /* in-flight dedup: a prefetch and a real download share ONE job */
 const gInFlight = globalThis as unknown as { __tlInFlight?: Map<string, Promise<ResolvedAudio>> };
@@ -673,6 +753,11 @@ export function prefetchStatus(videoId: string, bitrate: number): "cached" | "ru
   if (fs.existsSync(path.join(AUDIO_CACHE_DIR, `${videoId}-${bitrate}.mp3`))) return "cached";
   if (inFlightMap().has(`${videoId}:${bitrate}`)) return "running";
   return "idle";
+}
+
+/** how many engine jobs are in flight right now (queue-cap checks in routes) */
+export function inFlightCount(): number {
+  return inFlightMap().size;
 }
 
 async function resolveAudioInner(videoId: string, bitrate: number): Promise<ResolvedAudio> {
@@ -698,41 +783,67 @@ async function resolveAudioInner(videoId: string, bitrate: number): Promise<Reso
     return { provider: "ytdlp", localFile: cachedFile, cached: true, logs };
   }
 
+  // 0.5) cheap existence probe — a removed/wrong-ID video fails in ~1s with an
+  // honest "video" verdict instead of burning 65s across the whole chain
+  const exists = await videoExists(videoId);
+  if (exists === false) {
+    logs.push(`probe: video ${videoId} does not exist (thumbnail 404)`);
+    updateJob(key, { phase: "error", kind: "video" });
+    return { provider: "none", kind: "video", logs };
+  }
+
   await ensurePotServer();
 
   // server-wide circuit breaker: a streak of failed tracks means YouTube is
-  // throttling this IP/account — one shared pause, then resume (this is what
-  // kept playlists alive: never hammer a wall that just rejected you).
+  // throttling this IP/account — one shared pause, then resume. Jobs arriving
+  // INSIDE an open pause window wait out the remainder too (the old code let
+  // them slip past and hammer the wall the pause was guarding).
   const br = breaker();
-  if (br.streak >= 4 && Date.now() > br.pausedUntil) {
-    logs.push(`breaker: ${br.streak} consecutive failures — pausing 25s`);
-    br.pausedUntil = Date.now() + 25_000;
-    await new Promise((r) => setTimeout(r, 25_000));
-    br.streak = 2; // repeated badness keeps some pressure on
+  if (br.streak >= 4) {
+    if (Date.now() < br.pausedUntil) {
+      const rest = br.pausedUntil - Date.now();
+      logs.push(`breaker: inside pause window — waiting ${Math.ceil(rest / 1000)}s`);
+      if (await waitOrCancel(key, rest)) {
+        updateJob(key, { phase: "cancelled" });
+        return { provider: "none", cancelled: true, kind: "cancelled", logs };
+      }
+    } else {
+      logs.push(`breaker: ${br.streak} consecutive failures — pausing 25s`);
+      br.pausedUntil = Date.now() + 25_000;
+      const wasCancelled = await waitOrCancel(key, 25_000);
+      br.streak = 2; // repeated badness keeps some pressure on
+      if (wasCancelled) {
+        updateJob(key, { phase: "cancelled" });
+        return { provider: "none", cancelled: true, kind: "cancelled", logs };
+      }
+    }
   }
 
   // whole chain (cookie sets → direct → mirrors) with THREE retry rounds and
   // growing backoff: transient throttles and short cooldowns clear in seconds.
+  let videoProblem = false;
+  let userCancelled = false;
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) {
       logs.push(`retry: round ${attempt + 1}`);
-      await new Promise((r) => setTimeout(r, attempt === 1 ? 6_000 : 15_000));
+      if (await waitOrCancel(key, attempt === 1 ? 6_000 : 15_000)) { userCancelled = true; break; }
     }
-    if (isCancelled(key)) break;
+    if (isCancelled(key)) { userCancelled = true; break; }
 
-    // every cookie set cooling → WAIT OUT the nearest cooldown instead of
-    // dropping the track (waiting 30-90s beats failing the rest of a playlist)
-    const allSets = listCookieSets();
-    const coolingNow = allSets.filter((id) => setCooling(id));
-    if (allSets.length > 0 && coolingNow.length === allSets.length) {
-      const waitMs = Math.min(
-        90_000,
-        Math.max(...coolingNow.map((id) => (healthMap().get(id)?.until ?? Date.now()) - Date.now())) + 1_000
+    // every ELIGIBLE cookie set cooling → WAIT OUT the NEAREST cooldown instead
+    // of dropping the track. (The old code counted disabled/exiled sets too and
+    // waited out the FARTHEST cooldown — up to 90s of needless sleep.)
+    const eligible = orderedCookieSets();
+    const coolingNow = eligible.filter((id) => setCooling(id));
+    if (eligible.length > 0 && coolingNow.length === eligible.length) {
+      const nearest = Math.min(
+        ...coolingNow.map((id) => (healthMap().get(id)?.until ?? Date.now()) - Date.now())
       );
+      const waitMs = Math.max(0, Math.min(90_000, nearest + 1_000));
       if (waitMs > 0) {
         logs.push(`cookies: all sets cooling — waiting ${Math.round(waitMs / 1000)}s`);
-        await new Promise((r) => setTimeout(r, waitMs));
-        if (isCancelled(key)) break;
+        if (await waitOrCancel(key, waitMs)) { userCancelled = true; break; }
+        if (isCancelled(key)) { userCancelled = true; break; }
       }
     }
 
@@ -740,9 +851,9 @@ async function resolveAudioInner(videoId: string, bitrate: number): Promise<Reso
 
     // 1) yt-dlp with cookie sets — sticky first, AUTO-SWITCH immediately on failure
     for (const id of orderedSets) {
-      if (isCancelled(key)) break;
+      if (isCancelled(key)) { userCancelled = true; break; }
       try {
-        const f = await withGate(() =>
+        const f = await withGate(key, () =>
           runYtDlp(videoId, bitrate, cookieSetPath(id), progress)
         );
         evictCacheIfNeeded();
@@ -754,12 +865,18 @@ async function resolveAudioInner(videoId: string, bitrate: number): Promise<Reso
       } catch (e) {
         const msg = (e as Error).message;
         if (/^Cancelled$/.test(msg)) {
-          return { provider: "none", cancelled: true, logs };
+          return { provider: "none", cancelled: true, kind: "cancelled", logs };
+        }
+        if (isVideoProblem(msg)) {
+          // the VIDEO is the problem — no account will fix it; stop the whole
+          // chain now instead of retrying for another minute
+          videoProblem = true;
+          break;
         }
         // web client returned empty formats for this session? the cookie can
         // still be LIVE — SABR-safe cookie-capable clients are the second rung
         try {
-          const f = await withGate(() =>
+          const f = await withGate(key, () =>
             runYtDlp(videoId, bitrate, cookieSetPath(id), progress, false, true)
           );
           evictCacheIfNeeded();
@@ -771,7 +888,11 @@ async function resolveAudioInner(videoId: string, bitrate: number): Promise<Reso
         } catch (e2) {
           const msg2 = (e2 as Error).message;
           if (/^Cancelled$/.test(msg2)) {
-            return { provider: "none", cancelled: true, logs };
+            return { provider: "none", cancelled: true, kind: "cancelled", logs };
+          }
+          if (isVideoProblem(msg2)) {
+            videoProblem = true;
+            break;
           }
           noteSetResult(id, false, msg2);
           if (id === lastGoodSet) saveLastGoodSet(null); // only un-stick the set that failed
@@ -779,12 +900,13 @@ async function resolveAudioInner(videoId: string, bitrate: number): Promise<Reso
         }
       }
     }
+    if (videoProblem) break;
 
     // 2) yt-dlp direct (no cookies) — retry rounds also try android/ios player
     //    clients, whose format pool YouTube throttles separately from the web
     if (!isCancelled(key)) {
       try {
-        const f = await withGate(() => runYtDlp(videoId, bitrate, null, progress, attempt >= 1));
+        const f = await withGate(key, () => runYtDlp(videoId, bitrate, null, progress, attempt >= 1));
         evictCacheIfNeeded();
         logs.push(attempt >= 1 ? "ytdlp-direct+alt: ok" : "ytdlp-direct: ok");
         updateJob(key, { phase: "done", pct: 100 });
@@ -792,11 +914,16 @@ async function resolveAudioInner(videoId: string, bitrate: number): Promise<Reso
       } catch (e) {
         const msg = (e as Error).message;
         if (/^Cancelled$/.test(msg)) {
-          return { provider: "none", cancelled: true, logs };
+          return { provider: "none", cancelled: true, kind: "cancelled", logs };
+        }
+        if (isVideoProblem(msg)) {
+          videoProblem = true;
+          break;
         }
         logs.push(`ytdlp-direct: ${msg.slice(0, 160)}`);
       }
     }
+    if (userCancelled || videoProblem || isCancelled(key)) break;
 
     // 3) cobalt mirrors
     const cob = await tryCobalt(videoId, bitrate, logs);
@@ -806,19 +933,36 @@ async function resolveAudioInner(videoId: string, bitrate: number): Promise<Reso
     }
   }
 
-  updateJob(key, { phase: "error" });
-  return { provider: "none", logs };
+  // loop exits: user-cancel / video-problem / all 3 rounds exhausted — each
+  // gets its own honest verdict (the old code returned a bare {provider:"none"}
+  // for cancels too, so the breaker counted user actions as engine failures)
+  if (userCancelled || isCancelled(key)) {
+    cancelledSet().delete(key);
+    updateJob(key, { phase: "cancelled" });
+    return { provider: "none", cancelled: true, kind: "cancelled", logs };
+  }
+  const kind = videoProblem ? "video" : classifyFailure(logs);
+  updateJob(key, { phase: "error", kind });
+  return { provider: "none", kind, logs };
 }
 
 export function resolveAudio(videoId: string, bitrate: number): Promise<ResolvedAudio> {
   const key = jobKey(videoId, bitrate);
   const m = inFlightMap();
   const existing = m.get(key);
-  if (existing) return existing;
+  if (existing) {
+    // A request arriving right after a cancel is a FRESH intent: clear the
+    // stale cancel flag so the in-flight job continues and this caller gets a
+    // real result. (The old code joined the dying promise and echoed
+    // "Cancelled" back at the user.)
+    clearCancelled(key);
+    return existing;
+  }
   const p = resolveAudioInner(videoId, bitrate)
     .then((res) => {
-      // circuit-breaker accounting: success heals, failure builds pressure
-      if (res.cancelled) return res; // user actions don't count
+      // circuit-breaker accounting: success heals, failure builds pressure —
+      // but VIDEO problems and user cancels are not engine failures
+      if (res.cancelled || res.kind === "video") return res; // user/track actions don't count
       if (res.provider !== "none") breaker().streak = 0;
       else {
         const br = breaker();

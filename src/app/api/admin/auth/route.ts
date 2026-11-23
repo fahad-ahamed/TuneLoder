@@ -45,12 +45,16 @@ export async function POST(req: NextRequest) {
   }
   const { token, maxAgeSeconds } = issueSession();
   const res = NextResponse.json({ ok: true });
+  // `secure` only when the request actually arrived over https (direct https
+  // or behind a proxy via x-forwarded-proto). The old NODE_ENV check made
+  // plain-HTTP production logins impossible — the browser dropped the cookie.
+  const proto = req.headers.get("x-forwarded-proto") ?? req.nextUrl.protocol.replace(":", "");
   res.cookies.set(COOKIE_NAME, token, {
     httpOnly: true,
     sameSite: "lax",
     path: "/",
     maxAge: maxAgeSeconds,
-    secure: process.env.NODE_ENV === "production",
+    secure: proto === "https",
   });
   return res;
 }

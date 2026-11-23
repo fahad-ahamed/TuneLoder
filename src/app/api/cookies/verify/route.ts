@@ -26,7 +26,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "No cookie sets to verify" }, { status: 400 });
   }
 
-  const results = [];
+  const results: Array<{ id: number; at: string; ok: boolean; kind: string; message: string }> = [];
   for (const id of targets) {
     const r = await probeCookieFile(cookieSetPath(id));
     const verdict = { at: new Date().toISOString(), ok: r.ok, kind: r.kind, message: r.message };

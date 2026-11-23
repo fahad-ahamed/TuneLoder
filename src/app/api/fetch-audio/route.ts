@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import fs from "fs";
 import path from "path";
 import { resolveAudio, convertToMp3, cookiesEnabled } from "@/lib/ytd/providers";
+import { hasInternalKey } from "@/lib/ytd/internalkey";
 import { startSweeper, scheduleRemoval } from "@/lib/ytd/cleanup";
 
 export const runtime = "nodejs";
@@ -13,7 +14,8 @@ const ALLOWED_BITRATES = [320, 256, 192, 128, 96, 64];
 function safeName(s: string, fallback: string): string {
   const clean = s
     .normalize("NFKD")
-    .replace(/[^\p{L}\p{N} ()\-'.,&]/gu, "")
+    // \p{M} = vowel signs / combining marks — without it Bangla names lose their কার ("মন মাঝে" → "মন মঝ")
+    .replace(/[^\p{L}\p{N}\p{M} ()\-'.,&]/gu, "")
     .replace(/[\\/:*?"<>|]/g, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -23,10 +25,14 @@ function safeName(s: string, fallback: string): string {
 /**
  * Internal endpoint used by the Telegram bot: same engine as /api/download
  * (cookie-set auto-switch included) but returns JSON with the on-disk path
- * instead of streaming. The caller is responsible for deleting the file after
- * sending (a 10-min scheduled removal + sweeper cover leaks).
+ * instead of streaming. Protected by the shared internal key
+ * (data/internal-key.json → header `x-internal-key`) — it used to expose
+ * server file paths with no auth at all.
  */
 export async function POST(req: NextRequest) {
+  if (!hasInternalKey(req)) {
+    return Response.json({ ok: false, error: "Not authorized (missing internal key)" }, { status: 401 });
+  }
   let body: {
     videoId?: string;
     bitrate?: number;
@@ -56,16 +62,24 @@ export async function POST(req: NextRequest) {
   }
 
   if (resolved.provider === "none") {
+    // honest messages per failure class — never blame cookies for a dead video
+    const hint =
+      resolved.kind === "video"
+        ? "This video can't be downloaded — it's private, removed, age-restricted or not a video."
+        : cookiesEnabled()
+          ? resolved.kind === "rate"
+            ? "YouTube is rate-limiting the server — try again in a minute."
+            : "All cookie sets were rejected — add a fresh cookies.txt via Settings."
+          : "Server IP rate-limited — add cookies via Settings.";
     return Response.json(
       {
         ok: false,
-        error: "All providers failed on this network.",
-        hint: cookiesEnabled()
-          ? "All cookie sets were rejected — add a fresh cookies.txt via Settings."
-          : "Server IP rate-limited — add cookies via Settings.",
+        error: resolved.kind === "video" ? "This video is unavailable." : "All providers failed on this network.",
+        hint,
+        kind: resolved.kind ?? "unknown",
         logs: resolved.logs.slice(-6),
       },
-      { status: 422 }
+      { status: resolved.kind === "video" ? 404 : 422 }
     );
   }
 

@@ -17,6 +17,10 @@ import {
   Clock3,
   RotateCcw,
   Settings2,
+  FileArchive,
+  FolderUp,
+  Rows3,
+  Ban,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -42,13 +46,35 @@ type Info =
   | { type: "playlist"; playlistId: string; title: string; author: string; trackCount: number; tracks: Track[] };
 
 type DlState = {
-  status: "queued" | "downloading" | "done" | "error";
+  status: "queued" | "downloading" | "done" | "error" | "sent";
   ms?: number;
   sizeKB?: number;
   hint?: string;
   pct?: number;
   speed?: string;
   eta?: string;
+  /** server streamed the whole response → "Sent to your browser ✓" */
+  delivered?: boolean;
+};
+
+type PlaylistDelivery = "zip" | "folder" | "separate";
+
+type BatchView = {
+  id: string;
+  status: "prepared" | "running" | "complete" | "cancelled" | "abandoned";
+  delivered: boolean;
+  zipBytes?: number;
+  zipFileName?: string;
+  items: Array<{
+    videoId: string;
+    index: number;
+    status: "queued" | "running" | "done" | "failed" | "skipped";
+    pct?: number;
+    speed?: string;
+    eta?: string;
+    sizeBytes?: number;
+    error?: string;
+  }>;
 };
 
 const BITRATES = [320, 256, 192, 128] as const;
@@ -77,6 +103,22 @@ function saveBlob(blob: Blob, name: string) {
   setTimeout(() => URL.revokeObjectURL(url), 4000);
 }
 
+/** guaranteed navigation download — call INSIDE the user's click handler */
+function navigateDownload(href: string, fileName?: string) {
+  const a = document.createElement("a");
+  a.href = href;
+  if (fileName) a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+function fmtBytes(n: number): string {
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${n} B`;
+}
+
 /* ------------------------------------------------------------------ */
 /* page                                                                */
 /* ------------------------------------------------------------------ */
@@ -92,30 +134,42 @@ export default function Home() {
   const [batch, setBatch] = useState<{ done: number; total: number; failed: number } | null>(null);
   const [retryTracks, setRetryTracks] = useState<Track[]>([]);
   const [maxConc, setMaxConc] = useState(2);
-  const [engine, setEngine] = useState<{ delivery: "blob" | "native"; autoPrefetch: boolean }>({
-    delivery: "blob",
-    autoPrefetch: false,
-  });
+  const [engine, setEngine] = useState<{
+    delivery: "blob" | "native";
+    autoPrefetch: boolean;
+    playlistDelivery: "zip" | "separate";
+  }>({ delivery: "blob", autoPrefetch: false, playlistDelivery: "zip" });
+
+  // playlist delivery: ZIP (default) | Save to folder (desktop Chromium) | separate MP3s
+  const [plDelivery, setPlDelivery] = useState<PlaylistDelivery>("zip");
+  const folderPickerAvailable = typeof window !== "undefined" && "showDirectoryPicker" in window;
+
+  // ZIP batch state
+  const [preparedId, setPreparedId] = useState<string | null>(null);
+  const [zipRun, setZipRun] = useState<BatchView | null>(null);
+  const zipPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const inputRef = useRef<HTMLInputElement>(null);
   const prefetched = useRef<Set<string>>(new Set());
   const pfPlaylistKey = useRef<string | null>(null);
 
-  /* client download pool: keeps the browser from hammering the server
-     (server serializes the engine anyway — this prevents accidental
-     long-waiting requests when clicking many rows quickly)            */
+  /* client download pool: keeps the browser from hammering the server —
+     capped by the ADMIN's engine concurrency (the old code hardcoded 2) */
   const pool = useRef<{ queued: Array<() => void>; running: number }>({ queued: [], running: 0 });
 
-  // server-tuned concurrency (small-RAM hosts report 1; browser caps at 2)
+  // server-tuned concurrency + settings
   useEffect(() => {
     fetch("/api/status")
       .then((r) => r.json())
       .then((d) => {
-        if (d?.maxConcurrency) setMaxConc(Math.max(1, Math.min(2, d.maxConcurrency)));
+        if (d?.maxConcurrency) setMaxConc(Math.max(1, Math.min(8, d.maxConcurrency)));
         if (d?.settings) {
           setEngine({
             delivery: d.settings.delivery === "native" ? "native" : "blob",
             autoPrefetch: !!d.settings.autoPrefetchPlaylist,
+            playlistDelivery: d.settings.playlistDelivery === "separate" ? "separate" : "zip",
           });
+          if (d.settings.playlistDelivery === "separate") setPlDelivery("separate");
         }
       })
       .catch(() => {});
@@ -131,8 +185,157 @@ export default function Home() {
     setRetryTracks([]);
   }, [info]);
 
-  // SPEED: prefetch the MP3 the moment a single track appears — by the time
-  // the user clicks "Download" it's already on disk → ~1s instead of ~20s
+  /* ---------------- ZIP batch preparation (selection changes) ---------------- */
+
+  const selectedList: Track[] = useMemo(
+    () => tracks.filter((t) => selected.has(t.videoId)),
+    [tracks, selected]
+  );
+
+  // prepared batch follows the selection — debounce 600ms, engine NOT started
+  useEffect(() => {
+    if (info?.type !== "playlist" || plDelivery !== "zip" || selectedList.length === 0) {
+      setPreparedId(null);
+      return;
+    }
+    const t = setTimeout(() => {
+      fetch("/api/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          items: selectedList.map((x) => ({ videoId: x.videoId, title: x.title, author: x.author })),
+          bitrate,
+          title: info.title,
+        }),
+      })
+        .then((r) => r.json())
+        .then((d) => {
+          if (d?.id) setPreparedId(d.id);
+        })
+        .catch(() => {});
+    }, 600);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [info, selected, bitrate, plDelivery]);
+
+  const stopZipPoll = () => {
+    if (zipPollRef.current) {
+      clearInterval(zipPollRef.current);
+      zipPollRef.current = null;
+    }
+  };
+
+  /** poll the batch while the zip builds; mirror rows into dl[] honestly */
+  const pollZip = useCallback((id: string) => {
+    stopZipPoll();
+    zipPollRef.current = setInterval(() => {
+      fetch(`/api/batch?id=${encodeURIComponent(id)}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d: BatchView | null) => {
+          if (!d) return;
+          setZipRun(d);
+          setDl((s) => {
+            const next = { ...s };
+            for (const it of d.items) {
+              const row: DlState | undefined = next[it.videoId];
+              if (it.status === "running" && (it.pct != null || row?.status !== "downloading")) {
+                next[it.videoId] = {
+                  status: "downloading",
+                  pct: it.pct,
+                  speed: it.speed,
+                  eta: it.eta,
+                };
+              } else if (it.status === "done" && it.sizeBytes != null) {
+                next[it.videoId] = {
+                  status: d.delivered ? "sent" : "done",
+                  sizeKB: Math.round(it.sizeBytes / 1024),
+                  delivered: d.delivered,
+                };
+              } else if (it.status === "failed") {
+                next[it.videoId] = { status: "error", hint: it.error ?? "failed" };
+              } else if (it.status === "skipped") {
+                next[it.videoId] = { status: "error", hint: it.error ?? "cancelled" };
+              }
+            }
+            return next;
+          });
+          if (d.status === "complete" || d.status === "cancelled" || d.status === "abandoned") {
+            stopZipPoll();
+            setBatchRunning(false);
+            if (d.status === "complete") {
+              const failedCount = d.items.filter((x) => x.status === "failed").length;
+              setBatch((b) => (b ? { ...b, failed: failedCount } : b));
+              toast.success(
+                `ZIP ready — ${d.items.filter((x) => x.status === "done").length} file(s), ${fmtBytes(d.zipBytes ?? 0)}. Check your browser's download list.`
+              );
+            } else if (d.status === "cancelled") {
+              toast("ZIP cancelled — nothing was saved");
+            }
+          }
+        })
+        .catch(() => {});
+    }, 1000);
+  }, []);
+
+  /** the ONE guaranteed download: click handler navigates synchronously */
+  const startZipDownload = useCallback(() => {
+    if (!selectedList.length) {
+      toast.error("Select at least one track");
+      return;
+    }
+    if (zipRun && (zipRun.status === "running")) return; // already building
+    const go = (id: string) => {
+      setBatchRunning(true);
+      setBatch({ done: 0, total: selectedList.length, failed: 0 });
+      // reset rows to queued
+      setDl((s) => {
+        const next = { ...s };
+        for (const t of selectedList) next[t.videoId] = { status: "queued" };
+        return next;
+      });
+      // single click → single download — always passes Chrome's limiter
+      navigateDownload(`/api/download-zip?id=${encodeURIComponent(id)}`, `${safeName(info?.type === "playlist" ? info.title : "Playlist")} [${bitrate}kbps].zip`);
+      pollZip(id);
+    };
+    if (preparedId) {
+      go(preparedId);
+    } else {
+      // rare path: selection changed <600ms ago. The fetch is quick — Chrome's
+      // transient activation (5s) covers it, so the navigation still counts.
+      fetch("/api/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          items: selectedList.map((x) => ({ videoId: x.videoId, title: x.title, author: x.author })),
+          bitrate,
+          title: info?.type === "playlist" ? info.title : "Playlist",
+        }),
+      })
+        .then((r) => r.json())
+        .then((d) => {
+          if (d?.id) {
+            setPreparedId(d.id);
+            go(d.id);
+          } else toast.error(d?.error ?? "Could not prepare the ZIP");
+        })
+        .catch(() => toast.error("Could not prepare the ZIP"));
+    }
+  }, [selectedList, preparedId, bitrate, info, pollZip, zipRun]);
+
+  const cancelZip = useCallback(() => {
+    if (!zipRun) return;
+    fetch("/api/batch/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: zipRun.id }),
+    }).catch(() => {});
+    toast("Cancelling ZIP…");
+  }, [zipRun]);
+
+  useEffect(() => stopZipPoll, []);
+
+  /* ---------------- SPEED: prefetch single track ---------------- */
+
   useEffect(() => {
     if (info?.type === "video") {
       const key = `${info.track.videoId}:${bitrate}`;
@@ -148,7 +351,6 @@ export default function Home() {
   }, [info, bitrate]);
 
   // ADMIN OPT-IN: auto-prefetch whole playlists server-side (first 50 tracks)
-  // so batch clicks land on the on-disk cache → near-instant rows.
   useEffect(() => {
     if (info?.type === "playlist" && engine.autoPrefetch && info.tracks.length > 0) {
       const k = `${info.playlistId}:${bitrate}`;
@@ -187,6 +389,9 @@ export default function Home() {
     setLoading(true);
     setInfo(null);
     setDl({});
+    setZipRun(null);
+    setPreparedId(null);
+    stopZipPoll();
     try {
       const res = await fetch("/api/info", {
         method: "POST",
@@ -300,11 +505,18 @@ export default function Home() {
             fetch(`/api/progress?key=${encodeURIComponent(key)}`)
               .then((r) => r.json())
               .then((j) => {
-                if (j?.phase === "done") {
+                if (j?.delivered) {
                   clearInterval(iv);
                   setDl((s) => ({
                     ...s,
-                    [t.videoId]: { status: "done", ms: Math.round(performance.now() - t0) },
+                    [t.videoId]: { status: "sent", delivered: true, ms: Math.round(performance.now() - t0) },
+                  }));
+                  resolve(true);
+                } else if (j?.phase === "done") {
+                  clearInterval(iv);
+                  setDl((s) => ({
+                    ...s,
+                    [t.videoId]: { status: "sent", delivered: true, ms: Math.round(performance.now() - t0) },
                   }));
                   resolve(true);
                 } else if (j?.phase === "error") {
@@ -355,11 +567,11 @@ export default function Home() {
     }
   }, [engine.delivery]);
 
-  /** pooled: never more than maxConc browser downloads in flight */
+  /** pooled: never more than maxConc (admin value, 1–8) browser downloads */
   const startDownload = useCallback(
     (t: Track, quality: number): Promise<boolean> => {
       const p = pool.current;
-      const limit = Math.max(1, Math.min(2, maxConc));
+      const limit = Math.max(1, Math.min(8, maxConc));
       const run = async (): Promise<boolean> => {
         if (p.running >= limit) {
           await new Promise<void>((resolve) => p.queued.push(resolve));
@@ -378,18 +590,39 @@ export default function Home() {
     [downloadOne, maxConc]
   );
 
-  /* ---------------- batch download ---------------- */
+  /* ---------------- separate-MP3s batch (with the honest warning) ---------------- */
 
   const downloadList = useCallback(
     async (list: Track[], quality: number) => {
       if (!list.length) return;
       setBatchRunning(true);
       setBatch({ done: 0, total: list.length, failed: 0 });
-      let ok = 0;
-      let failed: Track[] = [];
+      toast.warning(
+        "Chrome will ask “Download multiple files?” — tap ALLOW, or only the first file will arrive."
+      );
 
-      // browser-side pool: max 2 in flight; the server serializes the engine anyway
+      // track 1: direct navigation INSIDE this gesture → guaranteed; the rest:
+      // fetch→blob saves with a 2.5s gap (Chrome's limiter accepts blobs more
+      // reliably once automatic downloads are allowed for the site)
+      let ok = 0;
+      const failed: Track[] = [];
       let cursor = 0;
+      const limit = Math.max(1, Math.min(8, maxConc));
+
+      const first = list[0];
+      if (engine.delivery === "native") {
+        const u = new URL("/api/download-file", window.location.origin);
+        u.searchParams.set("v", first.videoId);
+        u.searchParams.set("b", String(quality));
+        u.searchParams.set("t", first.title);
+        u.searchParams.set("a", first.author);
+        navigateDownload(u.toString(), `${safeName(first.title)} [${quality}kbps].mp3`);
+        cursor = 1;
+        ok++;
+        setBatch((b) => (b ? { ...b, done: 1 } : b));
+        setDl((s) => ({ ...s, [first.videoId]: { status: "sent", delivered: true } }));
+      }
+
       const worker = async () => {
         while (cursor < list.length) {
           const t = list[cursor++];
@@ -397,38 +630,123 @@ export default function Home() {
           if (success) {
             ok++;
             setBatch((b) => (b ? { ...b, done: b.done + 1 } : b));
+            await new Promise((r) => setTimeout(r, 2500)); // spacing saves blobs
           } else {
             failed.push(t);
             setBatch((b) => (b ? { ...b, failed: (b.failed ?? 0) + 1 } : b));
           }
         }
       };
-      const limit = Math.max(1, Math.min(2, maxConc));
-      await Promise.all(
-        Array.from({ length: Math.min(limit, list.length) }, () => worker())
-      );
+      await Promise.all(Array.from({ length: Math.min(limit, list.length) }, () => worker()));
 
       setBatchRunning(false);
       setBatch(null);
       if (failed.length) {
         setRetryTracks(failed);
-        toast.error(`Batch finished — ${ok}/${list.length} downloaded. Retry the failed ones below.`);
+        toast.error(
+          `Batch finished — ${ok}/${list.length} arrived. Missing files? Chrome blocked them — use ZIP instead.`
+        );
       } else {
         setRetryTracks([]);
-        toast.success(`Batch finished — ${ok}/${list.length} downloaded`);
+        toast.success(`Batch finished — ${ok}/${list.length} sent`);
       }
     },
-    [startDownload, maxConc]
+    [startDownload, maxConc, engine.delivery]
   );
+
+  /* ---------------- save to folder (desktop Chromium) ---------------- */
+
+  const saveToFolder = useCallback(async () => {
+    if (!selectedList.length) {
+      toast.error("Select at least one track");
+      return;
+    }
+    if (!("showDirectoryPicker" in window)) {
+      toast.error("Your browser doesn't support folder saving — use ZIP");
+      return;
+    }
+    try {
+      const dir = await (window as unknown as {
+        showDirectoryPicker: (o?: { mode?: string }) => Promise<FileSystemDirectoryHandle>;
+      }).showDirectoryPicker({ mode: "readwrite" });
+      setBatchRunning(true);
+      setBatch({ done: 0, total: selectedList.length, failed: 0 });
+      const failed: Track[] = [];
+      let ok = 0;
+      const limit = Math.max(1, Math.min(8, maxConc));
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < selectedList.length) {
+          const t = selectedList[cursor++];
+          try {
+            setDl((s) => ({ ...s, [t.videoId]: { status: "downloading" } }));
+            const res = await fetch("/api/download", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ videoId: t.videoId, bitrate, title: t.title, author: t.author }),
+            });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
+              throw new Error(err?.hint || err?.error || `HTTP ${res.status}`);
+            }
+            const blob = await res.blob();
+            const fh = await (dir as unknown as {
+              getFileHandle: (n: string, o?: { create?: boolean }) => Promise<{
+                createWritable: () => Promise<{
+                  write: (d: Blob) => Promise<void>;
+                  close: () => Promise<void>;
+                }>;
+              }>;
+            }).getFileHandle(`${safeName(t.title)} [${bitrate}kbps].mp3`, { create: true });
+            const w = await fh.createWritable();
+            await w.write(blob);
+            await w.close();
+            ok++;
+            setDl((s) => ({
+              ...s,
+              [t.videoId]: { status: "done", sizeKB: Math.round(blob.size / 1024) },
+            }));
+            setBatch((b) => (b ? { ...b, done: b.done + 1 } : b));
+          } catch (e) {
+            failed.push(t);
+            setDl((s) => ({ ...s, [t.videoId]: { status: "error", hint: (e as Error).message.slice(0, 120) } }));
+            setBatch((b) => (b ? { ...b, failed: (b.failed ?? 0) + 1 } : b));
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(limit, selectedList.length) }, () => worker()));
+      setBatchRunning(false);
+      setBatch(null);
+      if (failed.length) {
+        setRetryTracks(failed);
+        toast.error(`Saved ${ok}/${selectedList.length} — retry the failed ones below`);
+      } else {
+        toast.success(`Saved ${ok} MP3 file(s) to the folder — no ZIP needed`);
+      }
+    } catch (e) {
+      const err = e as Error;
+      if (err.name === "AbortError") return; // user closed the picker
+      setBatchRunning(false);
+      setBatch(null);
+      toast.error(`Folder save failed: ${err.message.slice(0, 120)}`);
+    }
+  }, [selectedList, bitrate, maxConc]);
+
+  /* ---------------- dispatch by delivery mode ---------------- */
 
   const downloadSelected = useCallback(() => {
     if (!selected.size) {
       toast.error("Select at least one track");
       return;
     }
-    const list = tracks.filter((t) => selected.has(t.videoId));
-    void downloadList(list, bitrate);
-  }, [selected, tracks, bitrate, downloadList]);
+    if (plDelivery === "zip") {
+      startZipDownload();
+    } else if (plDelivery === "folder") {
+      void saveToFolder();
+    } else {
+      void downloadList(selectedList, bitrate);
+    }
+  }, [selected, selectedList, bitrate, plDelivery, startZipDownload, saveToFolder, downloadList]);
 
   const retryFailed = useCallback(() => {
     const list = retryTracks.slice();
@@ -461,6 +779,8 @@ export default function Home() {
   };
 
   /* ---------------- render ---------------- */
+
+  const zipActive = batchRunning && plDelivery === "zip" && zipRun?.status === "running";
 
   return (
     <div className="min-h-screen flex flex-col bg-zinc-100 dark:bg-zinc-950 text-foreground selection:bg-rose-500/30">
@@ -621,6 +941,42 @@ export default function Home() {
                   </p>
                 </div>
               </div>
+
+              {/* delivery mode selector */}
+              <div className="mt-4">
+                <div className="inline-flex flex-wrap gap-1 rounded-xl border border-border bg-card/70 p-1">
+                  {([
+                    { k: "zip" as const, icon: FileArchive, label: "One ZIP file", hint: "recommended" },
+                    ...(folderPickerAvailable
+                      ? [{ k: "folder" as const, icon: FolderUp, label: "Save to folder", hint: "desktop Chrome" }]
+                      : []),
+                    { k: "separate" as const, icon: Rows3, label: "Separate MP3s", hint: "needs Allow" },
+                  ]).map((m) => (
+                    <button
+                      key={m.k}
+                      onClick={() => setPlDelivery(m.k)}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5 ${
+                        plDelivery === m.k
+                          ? "bg-rose-600 text-white shadow shadow-rose-900/50"
+                          : "text-muted-foreground hover:text-foreground"
+                      }`}
+                      aria-pressed={plDelivery === m.k}
+                      title={m.hint}
+                    >
+                      <m.icon className="h-3.5 w-3.5" />
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-1.5 text-[11px] text-muted-foreground/70">
+                  {plDelivery === "zip"
+                    ? "One click = one ZIP with every selected track inside — works on every browser and phone."
+                    : plDelivery === "folder"
+                      ? "Each MP3 is written straight into a folder you pick — no browser download prompt at all."
+                      : "One file per track. Chrome will ask “Download multiple files?” — tap ALLOW or files get dropped."}
+                </p>
+              </div>
+
               <div className="mt-4 flex flex-wrap items-center gap-2.5">
                 <Button
                   onClick={downloadSelected}
@@ -631,11 +987,35 @@ export default function Home() {
                   <span className="ml-1.5">
                     {batchRunning
                       ? batch
-                        ? `Downloading ${batch.done}/${batch.total}${batch.failed ? ` · ${batch.failed} failed` : ""}…`
-                        : "Downloading…"
-                      : `Download ${selected.size}`}
+                        ? zipActive
+                          ? `ZIP ${batch.done}/${batch.total}${batch.failed ? ` · ${batch.failed} failed` : ""}…`
+                          : `Sending ${batch.done}/${batch.total}${batch.failed ? ` · ${batch.failed} failed` : ""}…`
+                        : "Working…"
+                      : plDelivery === "zip"
+                        ? `Download ZIP · ${selected.size}`
+                        : plDelivery === "folder"
+                          ? `Save ${selected.size} to folder`
+                          : `Download ${selected.size}`}
                   </span>
                 </Button>
+                {zipActive && (
+                  <Button
+                    variant="outline"
+                    onClick={cancelZip}
+                    className="border-red-300 dark:border-red-800/60 bg-red-50 dark:bg-red-950/40 hover:bg-red-100 dark:hover:bg-red-900/40 text-red-700 dark:text-red-300 gap-1.5"
+                  >
+                    <Ban className="h-4 w-4" /> Cancel
+                  </Button>
+                )}
+                {zipRun?.status === "complete" && (
+                  <Button
+                    variant="outline"
+                    onClick={() => navigateDownload(`/api/download-zip?id=${encodeURIComponent(zipRun.id)}`, zipRun.zipFileName ?? "Playlist.zip")}
+                    className="border-border bg-card/60 hover:bg-secondary hover:text-white gap-1.5"
+                  >
+                    <FileArchive className="h-4 w-4" /> Save ZIP again
+                  </Button>
+                )}
                 <Button
                   variant="outline"
                   onClick={() => setSelected(new Set(tracks.map((t) => t.videoId)))}
@@ -659,6 +1039,14 @@ export default function Home() {
                   </Button>
                 )}
               </div>
+
+              {zipRun?.status === "complete" && (
+                <p className="mt-2 text-xs text-emerald-700 dark:text-emerald-400 font-medium">
+                  ZIP sent to your browser — {zipRun.items.filter((x) => x.status === "done").length} file(s),
+                  {" "}{fmtBytes(zipRun.zipBytes ?? 0)}{zipRun.items.some((x) => x.status === "failed") ? ` · ${zipRun.items.filter((x) => x.status === "failed").length} failed (see _FAILED.txt inside)` : ""}.
+                  Not in your download list? Use “Save ZIP again”.
+                </p>
+              )}
             </div>
 
             {/* track list */}
@@ -672,6 +1060,19 @@ export default function Home() {
                   onToggle={() => toggleSel(t.videoId)}
                   state={dl[t.videoId]}
                   onDownload={() => void startDownload(t, bitrate)}
+                  onQuickSave={
+                    plDelivery === "separate"
+                      ? () => {
+                          const u = new URL("/api/download-file", window.location.origin);
+                          u.searchParams.set("v", t.videoId);
+                          u.searchParams.set("b", String(bitrate));
+                          u.searchParams.set("t", t.title);
+                          u.searchParams.set("a", t.author);
+                          navigateDownload(u.toString(), `${safeName(t.title)} [${bitrate}kbps].mp3`);
+                          setDl((s) => ({ ...s, [t.videoId]: { status: "sent", delivered: true } }));
+                        }
+                      : undefined
+                  }
                   quality={bitrate}
                 />
               ))}
@@ -762,7 +1163,7 @@ function DownloadButton({
       disabled={busy}
       className="h-13 px-8 font-semibold bg-gradient-to-r from-rose-500 to-red-600 hover:from-rose-400 hover:to-red-500 text-white shadow-lg shadow-rose-900/40"
     >
-      {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : state?.status === "done" ? <CheckCircle2 className="h-5 w-5" /> : <Download className="h-5 w-5" />}
+      {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : state?.status === "done" || state?.status === "sent" ? <CheckCircle2 className="h-5 w-5" /> : <Download className="h-5 w-5" />}
       <span className="ml-2">
         {busy
           ? state?.status === "queued"
@@ -770,11 +1171,13 @@ function DownloadButton({
             : state?.pct != null
               ? `Downloading ${Math.round(state.pct)}%`
               : "Downloading…"
-          : state?.status === "done"
-            ? "Downloaded"
-            : state?.status === "error"
-              ? "Retry · " + quality + "kbps"
-              : `Download MP3 · ${quality}kbps`}
+          : state?.status === "sent"
+            ? "Sent to your browser ✓"
+            : state?.status === "done"
+              ? "Downloaded"
+              : state?.status === "error"
+                ? "Retry · " + quality + "kbps"
+                : `Download MP3 · ${quality}kbps`}
       </span>
     </Button>
   );
@@ -787,6 +1190,7 @@ function TrackRow({
   onToggle,
   state,
   onDownload,
+  onQuickSave,
   quality,
 }: {
   index: number;
@@ -795,11 +1199,13 @@ function TrackRow({
   onToggle: () => void;
   state?: DlState;
   onDownload: () => void;
+  onQuickSave?: () => void;
   quality: number;
 }) {
   const queued = state?.status === "queued";
   const busy = state?.status === "downloading" || queued;
   const done = state?.status === "done";
+  const sent = state?.status === "sent";
   const err = state?.status === "error";
   return (
     <div className="flex items-center gap-2 sm:gap-3 px-2.5 sm:px-3.5 py-2.5 hover:bg-card/70 transition-colors">
@@ -834,6 +1240,7 @@ function TrackRow({
       {queued && (
         <div className="flex items-center gap-1.5 text-xs text-muted-foreground shrink-0">
           <Clock3 className="h-3.5 w-3.5 animate-pulse" />
+          <span className="hidden sm:inline">Queued</span>
         </div>
       )}
       {state?.status === "downloading" && (
@@ -859,30 +1266,47 @@ function TrackRow({
           )}
         </div>
       )}
+      {sent && (
+        <div className="flex items-center gap-1.5 text-[11px] text-emerald-600/90 dark:text-emerald-400/90 font-medium shrink-0">
+          <CheckCircle2 className="h-3.5 w-3.5" />
+          <span className="hidden sm:inline">Sent ✓</span>
+        </div>
+      )}
       {err && (
         <div className="flex items-center gap-1.5 text-xs text-red-600 dark:text-red-400 shrink-0" title={state?.hint}>
           <XCircle className="h-4 w-4" />
         </div>
       )}
 
-      <Button
-        size="sm"
-        variant={done || err ? "outline" : "default"}
-        onClick={onDownload}
-        disabled={busy}
-        className={
-          done
-            ? "h-8 px-2.5 sm:px-3 border-border bg-secondary/40 hover:bg-secondary hover:text-white"
-            : err
-              ? "h-8 px-2.5 sm:px-3 border-amber-300 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-950/40 hover:bg-amber-100 dark:hover:bg-amber-900/40 text-amber-700 dark:text-amber-300"
-              : "h-8 px-2.5 sm:px-3 bg-rose-600 hover:bg-rose-500 text-white"
-        }
-      >
-        {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : done ? <Download className="h-3.5 w-3.5" /> : err ? <RotateCcw className="h-3.5 w-3.5" /> : <Download className="h-3.5 w-3.5" />}
-        <span className="ml-1 text-xs font-semibold">
-          {busy ? "…" : done ? <span className="hidden sm:inline">Again</span> : err ? <span>Retry</span> : <><span className="hidden sm:inline">MP3 </span>{quality}k</>}
-        </span>
-      </Button>
+      {onQuickSave && !busy && !done && !sent ? (
+        <Button
+          size="sm"
+          onClick={onQuickSave}
+          className="h-8 px-2.5 sm:px-3 bg-rose-600 hover:bg-rose-500 text-white"
+        >
+          <Download className="h-3.5 w-3.5" />
+          <span className="ml-1 text-xs font-semibold">{quality}k</span>
+        </Button>
+      ) : (
+        <Button
+          size="sm"
+          variant={done || err || sent ? "outline" : "default"}
+          onClick={onDownload}
+          disabled={busy}
+          className={
+            done || sent
+              ? "h-8 px-2.5 sm:px-3 border-border bg-secondary/40 hover:bg-secondary hover:text-white"
+              : err
+                ? "h-8 px-2.5 sm:px-3 border-amber-300 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-950/40 hover:bg-amber-100 dark:hover:bg-amber-900/40 text-amber-700 dark:text-amber-300"
+                : "h-8 px-2.5 sm:px-3 bg-rose-600 hover:bg-rose-500 text-white"
+          }
+        >
+          {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : done || sent ? <Download className="h-3.5 w-3.5" /> : err ? <RotateCcw className="h-3.5 w-3.5" /> : <Download className="h-3.5 w-3.5" />}
+          <span className="ml-1 text-xs font-semibold">
+            {busy ? "…" : done || sent ? <span className="hidden sm:inline">Again</span> : err ? <span>Retry</span> : <><span className="hidden sm:inline">MP3 </span>{quality}k</>}
+          </span>
+        </Button>
+      )}
     </div>
   );
 }

@@ -2,13 +2,18 @@
  * Live engine settings — persisted to data/config.json, editable from the
  * admin dashboard AT ANY TIME; every engine run reads them fresh (no restart).
  *
- *  maxConcurrency         parallel yt-dlp runs (0 = auto: env or cookie-aware default)
- *  runGapMs               breathing room between engine runs (anti rate-limit pacing)
- *  autoPrefetchPlaylist   server pre-prepares playlist tracks right after analysis
- *                         so clicks land on the cache (opt-in — costs bandwidth)
- *  delivery               how website downloads are delivered to the browser:
- *                           "blob"   — fetch + save (classic, stays on the page)
- *                           "native" — browser's own download manager UI
+ *  maxConcurrency    parallel yt-dlp runs (0 = auto: env or cookie-aware default)
+ *  runGapMs          breathing room between engine runs (anti rate-limit pacing)
+ *  autoPrefetchPlaylist  server pre-prepares playlist tracks right after analysis
+ *                        so clicks land on the cache (opt-in — costs bandwidth)
+ *  delivery          single-video delivery to the browser:
+ *                      "blob"   — fetch + save (classic, stays on the page)
+ *                      "native" — browser's own download manager UI
+ *  playlistDelivery  how a PLAYLIST is delivered (Chrome's multiple-download
+ *                    prompt silently drops every automatic download after the
+ *                    first — measured on Chrome 158):
+ *                      "zip"      — one click = one zip (default, works everywhere)
+ *                      "separate" — separate MP3s with an explicit warning
  */
 
 import fs from "fs";
@@ -27,6 +32,7 @@ export type EngineSettings = {
   runGapMs: number;
   autoPrefetchPlaylist: boolean;
   delivery: "blob" | "native";
+  playlistDelivery: "zip" | "separate";
   auth: AuthSettings;
 };
 
@@ -35,6 +41,7 @@ const DEFAULTS: EngineSettings = {
   runGapMs: 900,
   autoPrefetchPlaylist: false,
   delivery: "blob",
+  playlistDelivery: "zip",
   auth: { manualCookies: true, signIn: true },
 };
 
@@ -53,12 +60,13 @@ function readStore(): { settings?: Partial<EngineSettings> } {
 
 export function getSettings(): EngineSettings {
   const s = readStore().settings ?? {};
-  const a = s.auth ?? {};
+  const a = (s.auth ?? {}) as Partial<AuthSettings>;
   return {
     maxConcurrency: clampInt(s.maxConcurrency, 0, 8, DEFAULTS.maxConcurrency),
     runGapMs: clampInt(s.runGapMs, 200, 10_000, DEFAULTS.runGapMs),
     autoPrefetchPlaylist: s.autoPrefetchPlaylist === true,
     delivery: s.delivery === "native" ? "native" : "blob",
+    playlistDelivery: s.playlistDelivery === "separate" ? "separate" : "zip",
     auth: {
       manualCookies: a.manualCookies !== false,
       signIn: a.signIn !== false,

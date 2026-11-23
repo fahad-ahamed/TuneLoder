@@ -1,11 +1,18 @@
 /**
  * Live download-job progress registry (key = `${videoId}:${bitrate}`).
- * Shared by /api/download, /api/prefetch (same deduped job) and the UI's
- * /api/progress polling so the browser can show % / speed / ETA while
- * yt-dlp runs — downloads stop *feeling* slow.
+ * Shared by /api/download, /api/prefetch (same deduped job), the ZIP batch
+ * pipeline and the UI's /api/progress polling so the browser can show % /
+ * speed / ETA while yt-dlp runs — downloads stop *feeling* slow.
  */
 
-export type JobPhase = "starting" | "downloading" | "encoding" | "done" | "error" | "cancelled";
+export type JobPhase =
+  | "queued"
+  | "starting"
+  | "downloading"
+  | "encoding"
+  | "done"
+  | "error"
+  | "cancelled";
 
 export type Job = {
   key: string;
@@ -15,6 +22,12 @@ export type Job = {
   speed?: string;
   eta?: string;
   updatedAt: number;
+  /** position in the engine queue when phase === "queued" (1-based) */
+  position?: number;
+  /** full response has been streamed to the client (honest "Sent ✓" in the UI) */
+  delivered?: boolean;
+  /** terminal failure class: video | auth | rate | network | timeout | unknown */
+  kind?: string;
 };
 
 const g = globalThis as unknown as { __tlJobs?: Map<string, Job> };
@@ -43,6 +56,11 @@ export function getJob(key: string): Job | null {
     return null;
   }
   return j;
+}
+
+/** all live jobs — the batch/ZIP pipeline reads rows for its items from here */
+export function allJobs(): Job[] {
+  return [...jobs.values()];
 }
 
 /** yt-dlp --newline lines: `[download]  4.2% of ~3.20MiB at 1.50MiB/s ETA 00:06` */

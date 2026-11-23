@@ -52,6 +52,7 @@ type EngineStatus = {
     runGapMs?: number;
     autoPrefetchPlaylist?: boolean;
     delivery?: "blob" | "native";
+    playlistDelivery?: "zip" | "separate";
   };
 };
 
@@ -259,6 +260,7 @@ function AdminDashboard({ onPasswordCustom }: { onPasswordCustom: () => void }) 
   const [gap, setGap] = useState<string>("");
   const [prefetch, setPrefetch] = useState(false);
   const [delivery, setDelivery] = useState<"blob" | "native">("blob");
+  const [plDelivery, setPlDelivery] = useState<"zip" | "separate">("zip");
   const [setBusy, setSetBusy] = useState(false);
   const [formDirty, setFormDirty] = useState(false);
   const refreshTimer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -271,6 +273,7 @@ function AdminDashboard({ onPasswordCustom }: { onPasswordCustom: () => void }) 
     setGap((g) => (formDirty ? g : String(s.runGapMs ?? 900)));
     setPrefetch((v) => (formDirty ? v : !!s.autoPrefetchPlaylist));
     setDelivery((d) => (formDirty ? d : s.delivery === "native" ? "native" : "blob"));
+    setPlDelivery((d) => (formDirty ? d : s.playlistDelivery === "separate" ? "separate" : "zip"));
   }, [formDirty]);
 
   const refresh = useCallback(() => {
@@ -422,6 +425,7 @@ function AdminDashboard({ onPasswordCustom }: { onPasswordCustom: () => void }) 
           runGapMs: Number(gap) || 900,
           autoPrefetchPlaylist: prefetch,
           delivery,
+          playlistDelivery: plDelivery,
         }),
       });
       const data = await res.json();
@@ -549,10 +553,18 @@ function AdminDashboard({ onPasswordCustom }: { onPasswordCustom: () => void }) 
 
         <div className="mt-4 grid sm:grid-cols-2 gap-4">
           <div>
-            <label className="text-xs font-semibold text-foreground/80">Max concurrent downloads</label>
+            <label className="text-xs font-semibold text-foreground/80">Max concurrent downloads · একসাথে কত ডাউনলোড</label>
             <p className="text-[10px] text-muted-foreground/70 mt-0.5 leading-relaxed">
               How many yt-dlp jobs run in parallel (0 = auto: 1 with cookies, 2 without). Higher =
               faster but YouTube throttles harder.
+              <br />
+              <b>এটা আসলে কী?</b> এই সংখ্যাটা হলো সার্ভারের yt-dlp engine একসাথে কতটা ডাউনলোড চালাবে —
+              ওয়েবসাইট আর Telegram bot মিলে একই সীমা ভাগ করে নেয়। আগে এটা ঠিকমতো কাজ করত না:
+              ওয়েবসাইটের playlist সর্বোচ্চ ২-এ আটকে ছিল আর bot একবারে ঠিক ১টা নামাত। এখন ঠিক করা
+              হয়েছে — এখানে <b>৩</b> দিলে ওয়েবসাইট (ZIP/folder/separate সব মোডে) এবং bot দুটোই
+              একসাথে ৩টা ট্র্যাক নামাবে; বাকিগুলো স্বয়ংক্রিয়ভাবে queue-তে অপেক্ষা করবে।
+              <b>সর্বোচ্চ ৮</b> = সব একসাথে। সতর্কতা: বেশি দিলে দ্রুত হবে, কিন্তু YouTube একই
+              account/IP থেকে অনেক request দেখলে rate-limit করতে পারে — cookie থাকলে <b>২–৩</b> রাখাই ভালো।
             </p>
             <Input
               type="number"
@@ -596,6 +608,31 @@ function AdminDashboard({ onPasswordCustom }: { onPasswordCustom: () => void }) 
                   aria-pressed={delivery === m}
                 >
                   {m === "blob" ? "Blob (on-page)" : "Native (browser UI)"}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <label className="text-xs font-semibold text-foreground/80">Playlist delivery · প্লেলিস্ট ডাউনলোড</label>
+            <p className="text-[10px] text-muted-foreground/70 mt-0.5 leading-relaxed">
+              Chrome asks “Download multiple files?” for separate files and silently drops ALL but
+              the first if you don't tap Allow. One ZIP = one click = always works.
+              <br />
+              <b>ZIP (সুপারিশযোগ্য):</b> এক click-এ পুরো playlist একটাই .zip ফাইলে — সব ব্রাউজার/ফোনে কাজ করে।
+              <b>Separate MP3s:</b> প্রতিটা ট্র্যাক আলাদা ফাইল — Chrome “Download multiple files?” জিজ্ঞেস
+              করবে, Allow না চাপলে প্রথমটা ছাড়া বাকিগুলো নিঃশব্দে বাদ পড়ে।
+            </p>
+            <div className="mt-2 inline-flex rounded-xl border border-border bg-card/70 p-1 gap-1">
+              {(["zip", "separate"] as const).map((m) => (
+                <button
+                  key={m}
+                  onClick={() => { setPlDelivery(m); setFormDirty(true); }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                    plDelivery === m ? "bg-rose-600 text-white" : "text-muted-foreground hover:text-foreground"
+                  }`}
+                  aria-pressed={plDelivery === m}
+                >
+                  {m === "zip" ? "One ZIP (recommended)" : "Separate MP3s"}
                 </button>
               ))}
             </div>

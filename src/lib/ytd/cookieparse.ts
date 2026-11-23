@@ -275,7 +275,10 @@ export function parseCookieInput(raw: string): ParsedCookies {
   // 1) Netscape cookies.txt — tab-separated 7-column lines (allow stray headers)
   const lines = input.split(/\r?\n/);
   const tabbed = lines.filter((l) => l.trim() && (l.trim().startsWith("#HttpOnly_") || (!l.trim().startsWith("#") && l.split("\t").length >= 7)));
-  if (tabbed.length >= 2) return parseNetscapeLines(tabbed);
+  if (tabbed.length >= 2) {
+    const r = parseNetscapeLines(tabbed);
+    if (r) return r;
+  }
 
   // 2) JSON — array export or {"cookies":[…]} wrapper or plain {name:value}
   if (input.startsWith("{") || input.startsWith("[")) {

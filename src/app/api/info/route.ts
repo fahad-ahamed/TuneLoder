@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { parseYouTubeUrl } from "@/lib/ytd/providers";
+import { parseYouTubeUrl, videoExists } from "@/lib/ytd/providers";
 import { getVideoInfo, getPlaylistInfo } from "@/lib/ytd/meta";
 
 export const runtime = "nodejs";
@@ -21,6 +21,18 @@ export async function POST(req: NextRequest) {
       { error: "Not a valid YouTube link. Paste a video, Shorts or playlist URL." },
       { status: 400 }
     );
+  }
+
+  // cheap existence probe (thumbnail 404) BEFORE the download stage — a dead
+  // link fails here in ~1s with an honest message instead of 65s of retries
+  if (videoId) {
+    const exists = await videoExists(videoId);
+    if (exists === false) {
+      return NextResponse.json(
+        { error: "This video doesn't exist — it was removed or the ID is wrong." },
+        { status: 404 }
+      );
+    }
   }
 
   // playlist first when present (watch links may carry &list=)
