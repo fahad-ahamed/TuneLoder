@@ -16,6 +16,8 @@ import {
   HardDrive,
   Clock3,
   SlidersHorizontal,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -261,6 +263,7 @@ function AdminDashboard({ onPasswordCustom }: { onPasswordCustom: () => void }) 
   const [cookieText, setCookieText] = useState("");
   const [tg, setTg] = useState<TgStatus | null>(null);
   const [tgToken, setTgToken] = useState("");
+  const [showTgToken, setShowTgToken] = useState(false);
   const [tgBusy, setTgBusy] = useState(false);
   const [newPassword, setNewPassword] = useState("");
   const [pwBusy, setPwBusy] = useState(false);
@@ -1024,7 +1027,7 @@ function AdminDashboard({ onPasswordCustom }: { onPasswordCustom: () => void }) 
           )}
         </div>
 
-        {tg?.connected ? (
+        {tg?.connected && (
           <div className="mt-3 space-y-3">
             <div className="rounded-xl border border-border bg-card/40 p-3.5">
               <div className="text-xs font-semibold text-foreground">
@@ -1047,30 +1050,47 @@ function AdminDashboard({ onPasswordCustom }: { onPasswordCustom: () => void }) 
                 </details>
               )}
             </div>
-            <Button
-              onClick={disconnectBot}
-              disabled={tgBusy}
-              size="sm"
-              variant="outline"
-              className="border-border bg-card/60 hover:bg-red-100 dark:hover:bg-red-950/40 hover:text-red-700 dark:text-red-300 hover:border-red-300 dark:border-red-900/60"
-            >
-              <Trash2 className="h-4 w-4" /> Disconnect bot
-            </Button>
           </div>
-        ) : (
-          <div className="mt-3 space-y-3">
-            <p className="text-xs leading-relaxed text-muted-foreground/80">
-              Download MP3s straight inside Telegram: create a bot with{" "}
-              <span className="text-foreground/80">@BotFather</span> (send /newbot, copy the token),
-              paste it below and hit connect.
-            </p>
+        )}
+
+        <div className="mt-3 space-y-3">
+          <p className="text-xs leading-relaxed text-muted-foreground/80">
+            {tg?.connected ? (
+              <>
+                Want a different bot? Paste its token below and hit connect — the running bot is
+                replaced instantly, no disconnect needed. If the new token turns out wrong, your
+                current bot keeps running untouched.
+              </>
+            ) : (
+              <>
+                Download MP3s straight inside Telegram: create a bot with{" "}
+                <span className="text-foreground/80">@BotFather</span> (send /newbot, copy the
+                token), paste it below and hit connect.
+              </>
+            )}
+          </p>
+          <div className="relative">
             <Input
               value={tgToken}
               onChange={(e) => setTgToken(e.target.value)}
-              type="password"
+              type={showTgToken ? "text" : "password"}
               placeholder="123456789:AAH…"
-              className="h-10 bg-card/70 border-border font-mono text-xs focus-visible:ring-rose-500/50"
+              className="h-10 pr-10 bg-card/70 border-border font-mono text-xs focus-visible:ring-rose-500/50"
             />
+            <button
+              type="button"
+              onClick={() => setShowTgToken((v) => !v)}
+              aria-label={showTgToken ? "Hide token" : "Show token"}
+              className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-muted-foreground/70 hover:text-foreground"
+            >
+              {showTgToken ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            </button>
+          </div>
+          <p className="text-[11px] text-muted-foreground/60">
+            A real token is ~45 characters like <span className="font-mono">1234567890:AAHxxx…</span> —
+            tap the eye to compare what you pasted with BotFather, character for character.
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
             <Button
               onClick={connectBot}
               disabled={!tgToken.trim() || tgBusy}
@@ -1078,10 +1098,21 @@ function AdminDashboard({ onPasswordCustom }: { onPasswordCustom: () => void }) 
               className="bg-rose-600 hover:bg-rose-500 text-white font-semibold"
             >
               {tgBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Bot className="h-4 w-4" />}
-              Connect bot
+              {tg?.connected ? "Connect & replace bot" : "Connect bot"}
             </Button>
+            {tg?.connected && (
+              <Button
+                onClick={disconnectBot}
+                disabled={tgBusy}
+                size="sm"
+                variant="outline"
+                className="border-border bg-card/60 hover:bg-red-100 dark:hover:bg-red-950/40 hover:text-red-700 dark:text-red-300 hover:border-red-300 dark:border-red-900/60"
+              >
+                <Trash2 className="h-4 w-4" /> Disconnect
+              </Button>
+            )}
           </div>
-        )}
+        </div>
       </section>
 
       {/* password + auto-clean info */}

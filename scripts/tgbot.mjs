@@ -1239,7 +1239,13 @@ function acquireLock() {
 }
 
 process.on("exit", () => {
-  try { fs.rmSync(LOCK_FILE, { force: true }); } catch { /* noop */ }
+  // remove the lock ONLY if it is still OURS — an unconditional rm would erase
+  // a lock owned by a newer instance (that's how duplicate bots used to appear)
+  try {
+    if (fs.readFileSync(LOCK_FILE, "utf8").trim() === String(process.pid)) {
+      fs.rmSync(LOCK_FILE, { force: true });
+    }
+  } catch { /* lock already gone */ }
 });
 // guards: a crashing update handler must NEVER silently kill the whole bot
 process.on("uncaughtException", (e) => {
@@ -1279,7 +1285,7 @@ async function main() {
 
   try { fs.writeFileSync(PID_FILE, String(process.pid)); } catch { /* noop */ }
 
-  const me = await fetch(`${TG_BASE}/bot${token}/getMe`)
+  const me = await fetch(`${TG_BASE}/bot${token}/getMe`, { signal: AbortSignal.timeout(8_000) })
     .then((r) => r.json())
     .catch(() => null);
   if (!me?.ok) {
@@ -1306,8 +1312,22 @@ async function main() {
     }
     if (!res || !res.ok) {
       const code = res?.error_code;
-      log(`getUpdates failed: ${res?.description ?? "unknown"}`);
-      if (code === 401 || code === 409) process.exit(1); // bad token or duplicate poller
+      const desc = String(res?.description ?? "unknown");
+      log(`getUpdates failed: ${desc}`);
+      if (code === 401) process.exit(1); // bad token — nothing to heal
+      if (code === 409 && /webhook is active/i.test(desc)) {
+        // a leftover webhook (the token was used on some other bot platform
+        // before) blocks polling FOREVER — drop it once and keep polling here
+        try {
+          const d = await fetch(`${TG_BASE}/bot${token}/deleteWebhook`, { method: "POST" })
+            .then((r) => r.json());
+          log(`deleteWebhook: ${JSON.stringify(d).slice(0, 120)}`);
+        } catch (e) {
+          log(`deleteWebhook request failed: ${e.message}`);
+        }
+      } else if (code === 409) {
+        process.exit(1); // genuine duplicate poller — lock/sweep owns this case
+      }
       await sleep(3000);
       continue;
     }

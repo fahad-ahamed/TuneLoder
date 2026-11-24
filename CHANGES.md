@@ -499,3 +499,74 @@ bot-এ দুই user-এর ২০০+ track playlist-ও সম্পূর�
 - **YT regression (একই bot instance-এ):** Despacito → আগের মতো flow → 10.8MB ✓
 - **Website সাইড:** playlist → ZIP pipeline সরাসরি যাচাই — 22.8MB zip-এর ভেতরে ২টা আসল
   mp3 ✓; track link → কার্ড + Spotify tiers + download **delivered:true** ✓
+
+# v0.4.2 — TG bot disconnect → connect ঠিক করা (৩টা আসল বাগ)
+
+## লক্ষণ
+
+Admin panel থেকে bot disconnect করে আবার connect দিলে নতুন bot চালু হত না;
+মাঝে মাঝে panel "running" দেখাত অথচ bot আসলে মৃত — অথবা উল্টোটা।
+
+## মূল কারণ (৩টা, সব প্রমাণসহ ধরা হয়েছে)
+
+1. **Orphan bot + lock:** disconnect শুধু `tgbot.pid`-এর pid মারত — pidfile missing/stale
+   হলে পুরনো bot প্রক্রিয়া বেঁচে থাকত (প্রমাণ: একসাথে ২টা bot process, pidfile: none)।
+   সে অ্যাক্সেস লক ধরে রাখত → নতুন bot spawn হয়েই "another tgbot instance is already
+   running (lock held) — exiting" দিয়ে মরত → connect কখনোই সফল হত না।
+2. **Zombie প্রক্রিয়া:** detached bot মরলে parent (Next server) তাকে reap করত না —
+   zombie হয়ে ঝুলত; `process.kill(pid,0)` zombie-কেও "জীবিত" বলত (প্রমাণ: bot GET শুরুর
+   0.7s-এ মরেছে, অথচ ৯.৪s পর্যন্ত kill-0 alive বলেছে) → প্যানেল ভুল state + stale pid।
+3. **Race:** disconnect-এর পর exit-এর অপেক্ষা না করেই নতুন bot spawn → dying instance-এর
+   lock-এ ধাক্কা → instant exit। (সাথে: exit handler যেকোনো instance-এর lock-ই মুছত।)
+
+## ফিক্স (route.ts + tgbot.mjs)
+
+- `stopBot()`: pidfile + **/proc স্ক্যানে সব tgbot.mjs process** মারে (orphan sweep), সত্যিকারের
+  exit পর্যন্ত অপেক্ষা (≤4s) → SIGKILL fallback → pid + lock ফাইল পরিষ্কার
+- `isAlive()`: **/proc/<pid>/stat state** পড়ে — zombie-কে মৃত গণ্য (kill-0 আর মিথ্যা বলে না)
+- `startBot()`: spawn-এর পর **verdict-based verify** — নতুন log-এ "connected as @…" দেখলে
+  সফল, প্রক্রিয়া মরলে সৎ `running:false` (আর কখনো মিথ্যা pid লেখে না); exit listener রেখে
+  zombie ঠেকানো
+- tgbot.mjs: getMe-তে 8s timeout (ঝুলে থাকা বন্ধ) + exit handler এখন **শুধু নিজের lock**
+  মুছে (নতুন instance-এর lock আর নষ্ট হয় না)
+
+## টেস্ট প্রমাণ (deploy-এর পরে, আসল endpoint দিয়ে)
+
+- Fake orphan (lock ধরা) → DELETE → **orphan killed, lock+pidfile পরিষ্কার** ✓
+- Invalid token দিয়ে connect → bot মরে 0.78s-এ → GET **0.82s-এ সৎ `running:false`**,
+  pidfile নেই ✓ (আগে ছিল 9.4s + মিথ্যা running:true)
+- ক্লিন শেষ অবস্থা: connected:false, running:false, process 0 ✓
+
+> নোট: আগের bot-এর token config-মুছে-যাওয়ায় হারায়নি — BotFather থেকে একই token
+> পেস্ট করলেই একই bot (@fahadahamed_bot) ফেরত চলে আসবে।
+
+## v0.4.2 বোনাস — ইচ্ছেমতো bot swap (UI)
+
+- Admin panel-এর Telegram সেকশনে token ফর্ম এখন **সবসময় দেখায়** — আগে connected অবস্থায়
+  ফর্ম লুকানো থাকত, তাই bot বদলাতে আগে disconnect করতে হত (আর ওই মাঝেই connect-bug কামড়াত)
+- এখন: নতুন token পেস্ট → **Connect & replace bot** → পুরনো bot সঙ্গে সঙ্গে replace
+  (disconnect দরকার নেই)। নতুন token ভুল হলে পুরনো bot অক্ষত থাকে — validation
+  spawn-এর **আগে** হয়
+- Disconnect button এখনো আছে (Connect-এর পাশেই)
+
+## v0.4.2 বোনাস ২ — "Telegram rejected" বার্তা এখন কারণ বলে দেয়
+
+- Connect-এ Telegram 401 দিলে error-এ এখন token-এর **আকৃতি দেখায়** (`1234567890:… · 38 chars`)
+  — ৪২-অক্ষরের নিচে হলে সরাসরি বলে "অসম্পূর্ণ কপি" (notification preview থেকে কপি করলে
+  token কাটা পড়ে), আর পুরো দৈর্ঘ্য হলে deleted/revoked bot-এর নির্দেশনা দেয়
+- Token ইনপুটে **eye toggle** — পেস্ট করা টোকেন BotFather-এর সাথে চোখে মিলিয়ে নেওয়া যায়
+  (password-mask এ ম্যানুয়াল টাইপো ধরা পড়ত না)
+
+## v0.4.2 বোনাস ৩ — অন্য platform-এর webhook থাকলে bot এখন নিজেই সারতে হয়
+
+- **লক্ষণ:** নতুন bot connect হয় (getMe OK) কিন্তু কোনো message পায় না — লগে
+  `Conflict: can't use getUpdates method while webhook is active`
+- **কারণ:** token-টা আগে অন্য bot-hosting service-এ (basicdeploy.com) ব্যবহার হলে
+  ওরা Telegram-এ webhook বসিয়ে যায় — webhook খোলা থাকলে Telegram getUpdates বন্ধ রাখে
+- **আগের আচরণ:** webhook conflict-ও 409 → bot `exit(1)` → panel auto-heal আবার spawn →
+  আবার exit — অসীম respawn/মৃত্যু লুপ
+- **ফিক্স:** tgbot.mjs এখন webhook-conflict চিনে **নিজেই deleteWebhook** করে polling
+  চালু রাখে; সত্যিকারের duplicate-poller 409 হলেই শুধু exit
+- **টেস্ট প্রমাণ (আসল API দিয়ে):** setWebhook করে হুবহু ওই অবস্থা বানানো → connect →
+  লগে `webhook is active → deleteWebhook: ok → polling` — webhook পরে url="" ✓
+  প্রক্রিয়া জীবিত ✓ (১৪টা আটকে-থাকা পুরনো message-ও সঙ্গে সঙ্গে deliver হয়েছে)
