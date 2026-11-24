@@ -80,6 +80,16 @@ type BatchView = {
 
 const BITRATES = [320, 256, 192, 128] as const;
 
+/* Spotify quality tiers — shown in place of the YT bitrate chips when a
+   Spotify link is analyzed. The download itself still runs through the same
+   YT engine at the nearest available bitrate (engine: value below). */
+const SPOTIFY_TIERS = [
+  { kbps: 320, engine: 320, label: "Very High" },
+  { kbps: 160, engine: 192, label: "High" },
+  { kbps: 96, engine: 96, label: "Normal" },
+  { kbps: 24, engine: 64, label: "Low" },
+] as const;
+
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
@@ -129,6 +139,8 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [info, setInfo] = useState<Info | null>(null);
   const [bitrate, setBitrate] = useState<number>(320);
+  // current analysis came from a Spotify link → quality row shows Spotify tiers
+  const [spotifySource, setSpotifySource] = useState(false);
   const [dl, setDl] = useState<Record<string, DlState>>({});
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [batchRunning, setBatchRunning] = useState(false);
@@ -401,7 +413,7 @@ export default function Home() {
     const target = (raw ?? url).trim();
     if (!target) {
       if (!quiet) {
-        toast.error("Paste a YouTube link first");
+        toast.error("Paste a YouTube or Spotify link first");
         inputRef.current?.focus();
       }
       return;
@@ -412,6 +424,37 @@ export default function Home() {
     setZipRun(null);
     setPreparedId(null);
     stopZipPoll();
+
+    // SPOTIFY branch — metadata + YT matching happen in /api/spotify-info and
+    // the response reuses the exact Info shapes below, so every downstream
+    // flow (selection, ZIP, single download, progress) is untouched.
+    if (/open\.spotify\.com|spotify:(track|album|playlist)[:/]/i.test(target)) {
+      try {
+        const res = await fetch("/api/spotify-info", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: target }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data?.error ?? "Spotify link failed");
+        setSpotifySource(true);
+        setInfo(data as Info);
+        toast.success(
+          data.type === "playlist"
+            ? `Spotify ready — ${data.matchedCount ?? data.trackCount}/${data.trackCount} songs matched on YouTube`
+            : "Spotify track ready"
+        );
+      } catch (e) {
+        const msg = (e as Error).message || "Could not read this Spotify link";
+        if (quiet) console.warn("[analyze] spotify auto-run failed:", msg);
+        else toast.error(msg);
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
+    setSpotifySource(false);
     try {
       const res = await fetch("/api/info", {
         method: "POST",
@@ -442,7 +485,7 @@ export default function Home() {
   useEffect(() => {
     const t = url.trim();
     if (!t || t === lastAutoRef.current) return;
-    if (!/(?:youtube\.com|youtu\.be)\/[^\s]+/i.test(t)) return;
+    if (!/(?:youtube\.com|youtu\.be)\/[^\s]+/i.test(t) && !/open\.spotify\.com|spotify:(track|album|playlist)[:/]/i.test(t)) return;
     const handle = setTimeout(() => {
       lastAutoRef.current = t;
       analyze(t, true);
@@ -928,20 +971,30 @@ export default function Home() {
             </form>
           </div>
 
-          {/* quality selector */}
-          <div className="mt-5 inline-flex flex-wrap justify-center gap-1 max-w-full rounded-xl border border-border bg-card/60 p-1">
-            {BITRATES.map((b) => (
+          {/* quality selector — Spotify tiers when the source is Spotify */}
+          <div className="mt-5 inline-flex flex-wrap justify-center items-center gap-1 max-w-full rounded-xl border border-border bg-card/60 p-1">
+            {spotifySource && (
+              <span className="px-2 py-1.5 text-[10px] font-bold uppercase tracking-wider text-emerald-500">
+                Spotify
+              </span>
+            )}
+            {(spotifySource
+              ? SPOTIFY_TIERS.map((t) => ({ key: `sp${t.kbps}`, val: t.engine, text: `${t.kbps} kbps · ${t.label}` }))
+              : BITRATES.map((b) => ({ key: `yt${b}`, val: b, text: `${b} kbps` }))
+            ).map((opt) => (
               <button
-                key={b}
-                onClick={() => setBitrate(b)}
+                key={opt.key}
+                onClick={() => setBitrate(opt.val)}
                 className={`px-3 sm:px-4 py-1.5 rounded-lg text-sm font-semibold transition-all ${
-                  bitrate === b
-                    ? "bg-rose-600 text-white shadow shadow-rose-900/50"
+                  bitrate === opt.val
+                    ? spotifySource
+                      ? "bg-emerald-600 text-white shadow shadow-emerald-900/50"
+                      : "bg-rose-600 text-white shadow shadow-rose-900/50"
                     : "text-muted-foreground hover:text-foreground"
                 }`}
-                aria-pressed={bitrate === b}
+                aria-pressed={bitrate === opt.val}
               >
-                {b} kbps
+                {opt.text}
               </button>
             ))}
           </div>

@@ -432,3 +432,70 @@ bot-এ দুই user-এর ২০০+ track playlist-ও সম্পূর�
 | RAM | 550 MB available ✓ |
 | Audio cache | 589 MB (sweeper-own করা, স্বয়ংক্রিয় পরিষ্কার) ✓ |
 | /api/status tg link | fahadahamed_bot ✓ |
+
+# v0.4.0 — Spotify song downloading feature (YouTube path সম্পূর্ণ অস্পৃশ্য)
+
+## নতুন: Spotify link → MP3
+
+- **কীভাবে কাজ করে:** Spotify-র নিজের অডিও DRM-এনক্রিপ্টেড (Widevine) — সরাসরি
+  নামানো সম্ভব না, এই প্রজেক্ট সেটা চেষ্টাও করে না। বদলে এটা Spotify-র **পাবলিক
+  metadata** (গানের নাম, শিল্পী, কভার, দৈর্ঘ্য) পড়ে সেই গানের **সেরা মিল YouTube-এ
+  খুঁজে** বের করে আর আপনার বিদ্যমান YT ইঞ্জিনে ডাউনলোড করে — সাধারণ YT job হিসেবে
+- **link ধরা:** track / album / playlist (open.spotify.com ও spotify: URI)
+  — auto-analyze সহ (link পেস্ট করলেই শুরু)
+- **Metadata উৎস:** track + playlist → embed page (cookie ছাড়াই, no-auth);
+  album ও বড় playlist → admin-এর sp_dc cookie দিয়ে web API (paginated, ২০০ পর্যন্ত)
+- **Quality display (আপনার চাওয়ামতো):** Spotify link দিলে সেই একই জায়গায় YT-র
+  320/256/192/128 chips-এর বদলে **Spotify tiers** দেখায় — `320 · Very High`,
+  `160 · High`, `96 · Normal`, `24 · Low` (সবুজ, "Spotify" label সহ); ইঞ্জিন নিকটতম
+  bitrate-এ নামায় (320/192/96/64)। YT link দিলে আগের chips-ই ফেরে
+- **ফাইলের নাম:** Spotify-র গানের নাম/শিল্পী ব্যবহার হয় (YouTube-এর টাইটেল না)
+
+## Admin panel
+
+- নতুন card: **"Spotify cookie (sp_dc) · ঐচ্ছিক"** — save/clear, preview badge সহ
+  (cookie কখনো ফেরত দেখায় না, শুধু preview); `data/spotify-cookie.json`-এ আলাদা
+  সেভ — YouTube cookie-র সেট বা settings.json কোনোটাই অস্পৃশ্য
+- নতুন API: `/api/spotify-info`, `/api/spotify-cookie` (admin-gated)
+
+## সতর্কতা-নকশা (zero-touch on YT)
+
+- Spotify সব কোড নতুন ফাইলে (`src/lib/spotify.ts` + ২টা route); index.tsx-এ শুধু
+  additive branch + chips swap — কোনো YT ফাংশন বদলায়নি
+- `/api/info` (YT route) প্রমাণিত untouched — spotify link দিলে আগের মতোই সৎ error
+
+## টেস্ট প্রমাণ (আসল ব্রাউজার + সার্ভার)
+
+- Track: "Blinding Lights — The Weeknd" → matched `fHI8X4OXluQ` → engine job
+  `done · 100% · delivered:true` ✓
+- Playlist: "Today's Top Hits" → **50/50 matched** (নাম+শিল্পী সহ) ✓
+- Album cookie ছাড়া → সৎ বাংলা error (sp_dc দিলে full list) ✓
+- Browser: Spotify tiers + card ✓; Download → mp3 delivered ✓
+- **YT regression:** YT link → আগের chips/card ✓ → download done 100% ✓; bot alive ✓
+
+# v0.4.1 — Telegram bot-এও Spotify (website এর সাথে parity)
+
+## নতুন
+
+- **Bot-এ Spotify link support:** track / album / playlist (open.spotify.com ও spotify: URI,
+  si/utm-সহ পুরো link সহ) — metadata পড়ে গানগুলো YouTube-এ match করে একই ইঞ্জিনে নামায়
+  - 🤖 Auto mode → track: quality keyboard; album/playlist: আগের মতো picker (ট্র্যাক নাম্বার
+    টিপে select → Download) — সব বাটন আগের মতোই কাজ করে
+  - ✋ Manual mode → link পাঠালেই instant queue (saved quality-তে)
+  - Spotify মেসেজগুলোতে "🟢 Spotify · matched on YouTube (45/45 songs)" ট্যাগ
+- HELP-এ Spotify লাইন + fallback মেসেজ আপডেট
+
+## Zero-touch (YT অক্ষত)
+
+- `handleLink`-এ শুধু endpoint পছন্দ (`/api/info` ↔ `/api/spotify-info`) + বার্তায় ট্যাগ —
+  কোনো YT branch বদলায়নি; YT link detection আগের মতোই (spotify link YT finder-এ ধরা পড়ে না)
+- Bot daemon: restart → "connected as @fahadahamed_bot" ✓
+
+## টেস্ট প্রমাণ (আসল bot logic + আসল engine, Telegram স্টাব করে)
+
+- **Playlist** (আপনার হুবহু link): "Best of: Coke Studio Pakistan" → **45/45 matched** →
+  picker → ২টা select → আসল ডাউনলোড: Blockbuster 11.0MB · Jhol 10.7MB ✓
+- **Track** (আপনার হুবহু link): manual mode → instant → Blockbuster 11.0MB ✓
+- **YT regression (একই bot instance-এ):** Despacito → আগের মতো flow → 10.8MB ✓
+- **Website সাইড:** playlist → ZIP pipeline সরাসরি যাচাই — 22.8MB zip-এর ভেতরে ২টা আসল
+  mp3 ✓; track link → কার্ড + Spotify tiers + download **delivered:true** ✓

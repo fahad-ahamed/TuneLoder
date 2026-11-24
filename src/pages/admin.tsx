@@ -275,6 +275,10 @@ function AdminDashboard({ onPasswordCustom }: { onPasswordCustom: () => void }) 
   const [prefetch, setPrefetch] = useState(false);
   const [delivery, setDelivery] = useState<"blob" | "native">("blob");
   const [plDelivery, setPlDelivery] = useState<"zip" | "separate">("zip");
+  // Spotify sp_dc cookie (optional — richer metadata + web-API fallback)
+  const [spCookie, setSpCookie] = useState("");
+  const [spPreview, setSpPreview] = useState<string | null>(null);
+  const [spBusy, setSpBusy] = useState(false);
   const [setBusy, setSetBusy] = useState(false);
   const [formDirty, setFormDirty] = useState(false);
   const refreshTimer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -310,6 +314,10 @@ function AdminDashboard({ onPasswordCustom }: { onPasswordCustom: () => void }) 
       .then((r) => r.json())
       .then(setTg)
       .catch(() => setTg(null));
+    fetch("/api/spotify-cookie")
+      .then((r) => r.json())
+      .then((d) => setSpPreview(d?.preview ?? null))
+      .catch(() => {});
   }, [hydrateSettings]);
 
   useEffect(() => {
@@ -348,6 +356,31 @@ function AdminDashboard({ onPasswordCustom }: { onPasswordCustom: () => void }) 
     await fetch(`/api/cookies?id=${id}`, { method: "DELETE" }).catch(() => {});
     toast(`Cookie set ${id} removed`);
     refresh();
+  };
+
+  const saveSpCookie = async (clear = false) => {
+    setSpBusy(true);
+    try {
+      const res = await fetch("/api/spotify-cookie", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cookie: clear ? "" : spCookie.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error ?? "Failed");
+      setSpPreview(data?.preview ?? null);
+      if (clear) {
+        setSpCookie("");
+        toast.success("Spotify cookie মুছে ফেলা হয়েছে");
+      } else {
+        toast.success("Spotify cookie সেভ হয়েছে — পরের Spotify link-এ কাজ করবে");
+        setSpCookie("");
+      }
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setSpBusy(false);
+    }
   };
 
   /** REAL re-verification — ask YouTube about a set (or all sets) right now. */
@@ -550,6 +583,58 @@ function AdminDashboard({ onPasswordCustom }: { onPasswordCustom: () => void }) 
           retry — that's what keeps long playlists stable. Finished files are auto-deleted from
           the server after serving.
         </p>
+      </section>
+
+      {/* Spotify sp_dc cookie */}
+      <section className="rounded-2xl border border-border bg-card/50 p-5">
+        <div className="flex items-center gap-2">
+          <Music4 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+          <h2 className="text-sm font-semibold">Spotify cookie (sp_dc) · ঐচ্ছিক</h2>
+          <Badge
+            variant="outline"
+            className={`ml-auto text-[10px] ${
+              spPreview
+                ? "border-emerald-300 dark:border-emerald-800/60 bg-emerald-50 dark:bg-emerald-950/30 text-emerald-600 dark:text-emerald-400"
+                : "border-border text-muted-foreground"
+            }`}
+          >
+            {spPreview ? `saved · ${spPreview}` : "not set"}
+          </Badge>
+        </div>
+        <p className="mt-2 text-xs leading-relaxed text-muted-foreground/80">
+          Spotify-এর নিজের অডিও DRM-দ্বারা সুরক্ষিত — কেউ সেটা সরাসরি নামাতে পারে না। TuneLoad-এর
+          Spotify মোড তাই Spotify-র <b>পাবলিক metadata</b> (গানের নাম, শিল্পী, কভার) পড়ে সেটার
+          সেরা মিল ইউটিউবে খুঁজে আপনার একই ইঞ্জিন দিয়ে MP3 বানায়। এই sp_dc cookie দিলে বড়
+          playlist-এর metadata ও matching আরও নিখুঁত হয় (web API fallback) — না দিলেও সব
+          track/album/playlist কাজ করবে।
+          <br />
+          <b>কীভাবে পাবেন?</b> ব্রাউজারে spotify.com-এ লগইন করে DevTools → Application → Cookies →
+          <span className="font-mono"> sp_dc</span> ভ্যালুটা কপি করে এখানে পেস্ট করুন।
+        </p>
+        <div className="mt-3 flex gap-2">
+          <Input
+            type="password"
+            placeholder="sp_dc=… (paste the cookie value)"
+            value={spCookie}
+            onChange={(e) => setSpCookie(e.target.value)}
+            className="flex-1 h-10 bg-card/70 border-border font-mono text-sm focus-visible:ring-emerald-500/50"
+          />
+          <Button
+            disabled={spBusy || !spCookie.trim()}
+            onClick={() => saveSpCookie(false)}
+            className="h-10 px-4 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white"
+          >
+            {spBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : "Save"}
+          </Button>
+          <Button
+            disabled={spBusy || !spPreview}
+            variant="outline"
+            onClick={() => saveSpCookie(true)}
+            className="h-10 px-3"
+          >
+            Clear
+          </Button>
+        </div>
       </section>
 
       {/* engine settings (live) */}

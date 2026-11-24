@@ -163,6 +163,17 @@ export function findYouTubeLink(text) {
   return null;
 }
 
+/** Spotify track/album/playlist link (open.spotify.com or spotify: URI) */
+export function findSpotifyLink(text) {
+  for (const tok of String(text ?? "").split(/\s+/)) {
+    const t = tok.replace(/^<|>$/g, "");
+    if (/open\.spotify\.com\/(?:intl-[a-z]{2}\/)?(track|album|playlist)|spotify:(track|album|playlist)[:/]/i.test(t)) {
+      return t;
+    }
+  }
+  return null;
+}
+
 /* ------------------------------------------------------------------ */
 /* chunk system (unlimited size via ≤45MB parts)                       */
 /* ------------------------------------------------------------------ */
@@ -356,7 +367,8 @@ const PROGRESS_POLL_MS = 1300; // live progress edit cadence
 const EDIT_MIN_MS = 1300;      // Telegram edit rate-limit safety
 
 const HELP = [
-  "Send any YouTube link — video or playlist. Everything else is buttons:",
+  "Send any YouTube OR Spotify link — everything else is buttons:",
+  "• Spotify → track / album / playlist (songs are matched on YouTube and downloaded through the same engine)",
   "• quality → tap 320 / 256 / 192 / 128",
   "• playlist tracks → tap numbers to select, then Download",
   "• download mode → 🤖 Auto (ask per link) or ✋ Manual (link = instant download)",
@@ -831,11 +843,14 @@ export function createBot(deps) {
 
   /* ---------------- link intake ---------------- */
 
-  async function handleLink(chatId, url, placeholderId = null) {
+  async function handleLink(chatId, url, placeholderId = null, source = "yt") {
     const sess = getSession(chatId);
-    const info = await deps.api("/api/info", { url });
+    // "spotify" → /api/spotify-info (metadata + YouTube match); the response
+    // reuses the exact /api/info shapes, so every branch below is identical
+    const info = await deps.api(source === "spotify" ? "/api/spotify-info" : "/api/info", { url });
     if (!info.ok) throw new Error(info.data?.error || "Could not read that link");
     const d = info.data;
+    const spTag = source === "spotify" ? "🟢 Spotify · matched on YouTube" : "";
 
     /* ✋ MANUAL mode: link → download starts INSTANTLY with the saved quality.
        No quality question, no track picker — exactly like a downloader bot. */
@@ -847,7 +862,7 @@ export function createBot(deps) {
         enqueue(sess, [{ track: t, quality: q }]);
         await send(
           chatId,
-          `✋ Manual mode · ${q}kbps — download ${busy ? "queued" : "started"}:\n🎵 ${t.title}\n👤 ${t.author}`
+          `✋ Manual mode · ${q}kbps${spTag ? ` · ${spTag}` : ""} — download ${busy ? "queued" : "started"}:\n🎵 ${t.title}\n👤 ${t.author}`
         );
         pump(chatId);
         return;
@@ -860,7 +875,8 @@ export function createBot(deps) {
         sess,
         list.map((t) => ({ track: t, quality: q }))
       );
-      const msg = `✋ Manual mode · ${q}kbps — queueing ALL ${list.length}${tracks.length > cap ? ` (of ${tracks.length})` : ""} tracks:\n📋 ${d.title}`;
+      const spLine = spTag ? `${spTag} (${d.matchedCount ?? list.length}/${d.trackCount ?? tracks.length} songs)\n` : "";
+      const msg = `${spLine}✋ Manual mode · ${q}kbps — queueing ALL ${list.length}${tracks.length > cap ? ` (of ${tracks.length})` : ""} tracks:\n📋 ${d.title}`;
       if (placeholderId) await editMsg(chatId, placeholderId, msg);
       else await send(chatId, msg);
       pump(chatId);
@@ -876,7 +892,7 @@ export function createBot(deps) {
         : "";
       await send(
         chatId,
-        `🎵 ${t.title}\n👤 ${t.author}${t.duration ? `\n⏱ ${t.duration}` : ""}${note}\n\nTap a quality to download:`,
+        `${spTag ? `${spTag}\n` : ""}🎵 ${t.title}\n👤 ${t.author}${t.duration ? `\n⏱ ${t.duration}` : ""}${note}\n\nTap a quality to download:`,
         { reply_markup: kb(qualityRows(sess)) }
       );
       return;
@@ -892,10 +908,11 @@ export function createBot(deps) {
       selected: new Set(),
       page: 0,
     };
+    const pickerHead = spTag ? `${spTag}\n\n` : "";
     if (placeholderId) {
-      await editMsg(chatId, placeholderId, pickerText(sess), { reply_markup: kb(pickerRows(sess)) });
+      await editMsg(chatId, placeholderId, `${pickerHead}${pickerText(sess)}`, { reply_markup: kb(pickerRows(sess)) });
     } else {
-      await send(chatId, pickerText(sess), { reply_markup: kb(pickerRows(sess)) });
+      await send(chatId, `${pickerHead}${pickerText(sess)}`, { reply_markup: kb(pickerRows(sess)) });
     }
   }
 
@@ -1148,7 +1165,27 @@ export function createBot(deps) {
       return;
     }
 
-    return send(chatId, "Send me a YouTube link (video or playlist) — everything else is buttons.");
+    // Spotify link → same flow through /api/spotify-info (songs matched on
+    // YouTube, then the identical queue/picker/quality machinery runs)
+    const spLink = findSpotifyLink(text);
+    if (spLink) {
+      try {
+        const isList = /\/(album|playlist)|spotify:(album|playlist)[:/]/i.test(spLink);
+        let placeholder = null;
+        if (isList) {
+          placeholder = await send(
+            chatId,
+            "⏳ Spotify পড়া হচ্ছে — গানগুলো YouTube-এ match করা হচ্ছে… (বড় তালিকায় একটু সময় লাগে)"
+          );
+        }
+        await handleLink(chatId, spLink, placeholder?.message_id ?? null, "spotify");
+      } catch (e) {
+        await send(chatId, `⚠️ ${String(e.message).slice(0, 300)}`);
+      }
+      return;
+    }
+
+    return send(chatId, "Send me a YouTube or Spotify link (video / track / album / playlist) — everything else is buttons.");
   }
 
   // CRASH RECOVERY: any chat that had a pending queue when the bot died gets
